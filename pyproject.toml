@@ -1,0 +1,17 @@
+[project]
+name = "hrns"
+version = "0.1.0"
+description = "A DeepSeek-focused coding harness built around prefix cache hits"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []  # standard library only — runs with no pip install
+
+[project.scripts]
+hrns = "hrns.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hrns"]

@@ -1,0 +1,8 @@
+aiapi
+.env
+__pycache__/
+*.pyc
+.hrns/
+*.egg-info/
+build/
+dist/
