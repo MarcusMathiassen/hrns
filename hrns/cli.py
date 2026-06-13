@@ -1507,16 +1507,13 @@ class TypeAhead:
         with self._lock:
             in_request = self._req_prompt is not None
             act = self._editor.handle(ch, getch)
+            text = self._editor.text().strip() if act == "submit" else ""
 
         if in_request:
             if act == "submit":
-                with self._lock:
-                    self._req_text = self._editor.text().strip()
-                    self._editor.set_text("")
+                self._req_text = text
                 self._req_done.set()
             elif act in ("interrupt", "eof"):
-                with self._lock:
-                    self._editor.set_text("")
                 self._req_done.set()                  # empty answer = decline
             if self._spinner:
                 self._spinner.render_now()
@@ -1524,10 +1521,9 @@ class TypeAhead:
 
         if act == "submit":
             with self._lock:
-                text = self._editor.text().strip()
-                self._editor.set_text("")
                 if text:
                     self.queue.append(text)
+                self._editor.set_text("")
             if text and self._spinner:
                 self._spinner.println(dim("  + queued: ") + text)
         elif act == "shift-tab":
