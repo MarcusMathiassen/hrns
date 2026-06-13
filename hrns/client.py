@@ -1,7 +1,8 @@
 """A tiny, dependency-free DeepSeek client (OpenAI-compatible wire format).
 
-Only two endpoints are used:
+Endpoints used:
     GET  /models           -> connectivity / auth check (used by `/connect`)
+    GET  /user/balance     -> account balance (shown in status line)
     POST /chat/completions -> streamed chat, with usage.include for cache stats
 
 We stream so the user sees tokens as they arrive, and we set
@@ -54,6 +55,22 @@ class DeepSeekClient:
             raise DeepSeekError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}") from e
         except urllib.error.URLError as e:
             raise DeepSeekError(f"Could not reach {self.base_url}: {e.reason}") from e
+
+    def get_balance(self) -> float | None:
+        """Return the account balance in USD, or None on failure."""
+        req = urllib.request.Request(
+            f"{self.base_url}/user/balance", headers=self._headers(), method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            infos = data.get("balance_infos") or []
+            for entry in infos:
+                if entry.get("currency") == "USD":
+                    return float(entry.get("total_balance", 0))
+            return float(infos[0]["total_balance"]) if infos else None
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+            return None
 
     def stream_chat(
         self,

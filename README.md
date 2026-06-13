@@ -29,7 +29,7 @@ already seen. `hrns` leans into that:
 Every turn prints what actually happened:
 
 ```
-⚡ cache 3,412 hit / 88 miss (97%) · 156 out · $0.000056 (saved $0.000477)
+cache 3,412 hit / 88 miss (97%) · 156 out · $0.000056 (saved $0.000477)
 ```
 
 ## Install / run
@@ -57,18 +57,65 @@ environment or a project-local `.env`.
 
 | Command | What it does |
 |---|---|
-| `/connect` | Configure & test the DeepSeek connection (API key, base URL, model) |
+| `/connect` | Configure & test the DeepSeek connection (key, base URL, model) — **remembered for next run** |
 | `/sessions` | List saved sessions; `/sessions <id\|#>` resumes one (re-hits the cache) |
 | `/clear` | Archive the current session and start a fresh one |
 | `/memory` | `add <text>` / `rm <id>` / `clear` — durable facts baked into new sessions |
-| `/model` | Show or set the model for new sessions |
+| `/model` | Show or set the model for new sessions — **remembered for next run** |
+| `/mode` | Cycle approval mode: confirm → auto-edit → auto (or **Shift+Tab**) |
 | `/stats` | Cumulative tokens, cache-hit rate, and cost (with cache savings) |
 | `/help`, `/quit` | … |
 
 ## Tools
 
-The model can `read_file`, `list_dir`, `write_file`, and `run_bash`. Read-only
-tools run automatically; writing and running shell commands ask for confirmation.
+A modern coding-agent tool set:
+
+| Tool | Purpose |
+|---|---|
+| `read_file` | Read with line numbers + `offset`/`limit` paging |
+| `grep` | Regex content search (ripgrep-backed, stdlib fallback) |
+| `glob` | Find files by pattern (`**/*.py`), newest-first |
+| `list_dir` | Typed directory listing with sizes |
+| `edit_file` | Exact, unique `str_replace`; returns a unified diff |
+| `create_file` | New files only (won't clobber unless `overwrite`) |
+| `run_bash` | Shell with exit status + timeout |
+
+Read-only tools (`read_file`, `grep`, `glob`, `list_dir`) run automatically.
+Mutating tools (`edit_file`, `create_file`, `run_bash`) show a colored diff/preview
+and ask for confirmation first. Tool round-trips reuse the growing cached prefix,
+so a multi-step edit is nearly free after the first call.
+
+### Workspace containment
+
+hrns is sandboxed to the directory it was launched in. Any tool whose target
+path resolves **outside** that root — via an absolute path, `../`, or a symlink —
+is blocked until you approve that specific access, *even for read-only tools*:
+
+```
+⚠ read_file wants to read a path OUTSIDE the workspace:
+    /etc/passwd
+    workspace: /Users/you/project
+  allow access outside the workspace? [y/N]
+```
+
+`run_bash` is unconstrained (a shell can reach anywhere), so it always asks for
+confirmation regardless.
+
+### Approval modes (Shift+Tab)
+
+Press **Shift+Tab** at the prompt to cycle how much hrns asks before acting
+(or use `/mode`). The current mode shows as a badge on the prompt: `[confirm] ›`.
+
+| Mode | Behavior |
+|---|---|
+| `confirm` (default) | ask before every edit, file write, and command |
+| `auto-edit` | auto-approve `edit_file`/`create_file`; still ask for shell + outside-workspace |
+| `auto` | auto-approve all in-workspace actions incl. `run_bash`; still ask for outside-workspace |
+
+Auto-approved actions still print their diff/preview so you can see what happened.
+**Out-of-workspace access always asks, in every mode** — the sandbox boundary
+never auto-approves. The mode is remembered in `~/.hrns/config.json`, and the
+prompt badge always shows which mode you're in.
 
 ## Where data lives
 
@@ -84,7 +131,7 @@ Everything persists under `~/.hrns/` (override with `HRNS_HOME`):
 ## Models & pricing
 
 Defaults to `deepseek-chat`. Also knows `deepseek-reasoner` (thinking mode —
-its `reasoning_content` streams dimmed), and the `deepseek-v4-flash` /
+its `reasoning_content` is folded into the status spinner), and the `deepseek-v4-flash` /
 `deepseek-v4-pro` names. Pricing is from DeepSeek's
 [pricing page](https://api-docs.deepseek.com/quick_start/pricing) and lives in
 `hrns/config.py`.
@@ -97,7 +144,7 @@ hrns/
   client.py   # streaming DeepSeek client (stdlib urllib), cache-aware usage
   session.py  # append-only, prefix-stable session log + persistence
   memory.py   # persistent cross-session memory
-  tools.py    # read_file / list_dir / write_file / run_bash
+  tools.py    # read_file / grep / glob / list_dir / edit_file / create_file / run_bash
   cli.py      # REPL, slash commands, cache/cost status line
 ```
 

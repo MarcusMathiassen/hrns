@@ -56,6 +56,9 @@ class Session:
             "prompt_cache_miss_tokens": 0,
         }
     )
+    # current context size (tokens) — the latest request's prompt + completion.
+    # This is the exact size from the API, not an estimate.
+    context_tokens: int = 0
 
     # --- lifecycle -----------------------------------------------------
     @classmethod
@@ -79,6 +82,7 @@ class Session:
             messages=data.get("messages", []),
         )
         s.usage.update(data.get("usage", {}))
+        s.context_tokens = int(data.get("context_tokens", 0) or 0)
         return s
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,6 +93,7 @@ class Session:
             "updated_at": self.updated_at,
             "messages": self.messages,
             "usage": self.usage,
+            "context_tokens": self.context_tokens,
         }
 
     # --- append-only mutation -----------------------------------------
@@ -103,6 +108,15 @@ class Session:
         for k in ("prompt_tokens", "completion_tokens",
                   "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
             self.usage[k] += int(usage.get(k, 0) or 0)
+        # latest request reflects the live context size
+        self.context_tokens = (int(usage.get("prompt_tokens", 0) or 0)
+                               + int(usage.get("completion_tokens", 0) or 0))
+
+    def cost(self, pricing: dict[str, float]) -> float:
+        u = self.usage
+        return (u["prompt_cache_hit_tokens"] / 1e6 * pricing["cache_hit"]
+                + u["prompt_cache_miss_tokens"] / 1e6 * pricing["cache_miss"]
+                + u["completion_tokens"] / 1e6 * pricing["output"])
 
     # --- persistence ---------------------------------------------------
     def path(self, sessions_dir: Path) -> Path:
