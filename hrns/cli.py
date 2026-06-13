@@ -153,8 +153,9 @@ class Spinner:
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    def __init__(self) -> None:
+    def __init__(self, state: State) -> None:
         self.enabled = _TTY
+        self.state = state
         self._label = "working"
         self._lock = threading.Lock()
         self._io = threading.Lock()  # serialises stdout between threads
@@ -202,23 +203,23 @@ class Spinner:
         extra = extra_fn() if extra_fn else ""
         input_fn = self.input_line
         elapsed = time.monotonic() - self._t0
-        status = f"{cyan(self._frame)} {label} {dim(f'{elapsed:.0f}s')}{extra}"
+        spinner_part = f"{cyan(self._frame)} {label} {dim(f'{elapsed:.0f}s')}"
         with self._io:
             if self._paused.is_set() or self._stop.is_set():
                 return
             if input_fn is None:
-                sys.stdout.write(f"\r\033[K{status}")
+                sys.stdout.write(f"\r\033[K{spinner_part}")
                 sys.stdout.flush()
                 return
             parts: list[str] = []
             rows = _dock_ensure(parts)
             if rows == 0:                 # terminal too short to dock
-                sys.stdout.write(f"\r\033[K{status}  {input_fn()}")
+                sys.stdout.write(f"\r\033[K{spinner_part}  {input_fn()}")
                 sys.stdout.flush()
                 return
             top = rows - 2
             lead_fn = self.lead
-            head = (lead_fn() + dim(" · ") if lead_fn else "") + status
+            head = (lead_fn() + dim(" · ") if lead_fn else "") + spinner_part + dim(" · ") + statusline(self.state) + extra
             # hw cursor stays (hidden) in the flow so prints land there;
             # the input row paints its own block cursor. Hide BEFORE saving:
             # some terminals (Terminal.app, iTerm2) include visibility in the
@@ -513,7 +514,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     cfg, session, client = state.cfg, state.session, state.client
     assert client is not None
 
-    spinner = Spinner()
+    spinner = Spinner(state)
     typeahead.start(spinner)  # attach dock hooks first so no frame paints inline
     spinner.start("calling api")
     final_text = ""
@@ -559,15 +560,9 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                 fn = tc["function"]
                 label = _tool_label(fn)
                 spinner.set(label)
-                # what matters in the scrollback: the tool call itself…
-                _say(session, "meta", dim("  • ") + label, spinner)
                 # …and, for mutating tools, the diff/preview via the confirm gate
                 out = execute(fn["name"], fn["arguments"],
                               confirm=_make_confirm(spinner, state, typeahead))
-                if fn["name"] == "run_bash":
-                    preview = (out or "").strip()[:80].replace("\n", " ")
-                    if preview:
-                        _say(session, "meta", dim(f"    -> {preview}"), spinner)
                 session.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
             # loop so the model can read the tool results
     except KeyboardInterrupt:
@@ -621,18 +616,23 @@ def _tool_label(fn: dict) -> str:
     }.get(name, name)
 
 
-def _diff_preview(old: str, new: str, limit: int = 14) -> str:
-    """A small colored +/- preview of an edit, for the confirm prompt."""
-    body = [
-        ln for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1)
-        if not ln.startswith(("---", "+++", "@@"))
-    ]
-    out = []
-    for ln in body[:limit]:
-        out.append(green(ln) if ln.startswith("+") else red(ln) if ln.startswith("-") else dim(ln))
-    if len(body) > limit:
-        out.append(dim(f"… (+{len(body) - limit} more diff lines)"))
-    return "\n".join("    " + o for o in out)
+def _diff_preview(old: str, new: str, limit: int = 14) -> list[str]:
+    """Colored +/- diff lines, limited to `limit` lines."""
+    lines = []
+    for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1):
+        if ln.startswith(("---", "+++", "@@")):
+            continue
+        if ln.startswith("+"):
+            lines.append(green(ln))
+        elif ln.startswith("-"):
+            lines.append(red(ln))
+        else:
+            lines.append(dim(ln))
+    total = len(lines)
+    if total > limit:
+        lines = lines[:limit]
+        lines.append(dim(f"… (+{total - limit} more lines)"))
+    return lines
 
 
 def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str:
@@ -647,18 +647,24 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
                 f"    {bold(str(path))}\n"
                 + dim(f"    workspace: {workspace_root()}"))
     if name == "edit_file":
-        head = f"{magenta('edit')} {bold(str(args.get('path', '?')))}"
-        if args.get("replace_all"):
-            head += dim(" (replace_all)")
-        return head + "\n" + _diff_preview(args.get("old_string", ""), args.get("new_string", ""))
+        path = str(args.get("path", "?"))
+        old = args.get("old_string", "")
+        new = args.get("new_string", "")
+        head = f"{magenta('edit')} {bold(path)}"
+        extra = dim(" (replace_all)") if args.get("replace_all") else ""
+        diff = "\n".join("    " + ln for ln in _diff_preview(old, new))
+        return f"  {head}{extra}\n{diff}"
     if name == "create_file":
         content = args.get("content", "")
-        preview = "\n".join("    " + green("+ " + ln) for ln in content.splitlines()[:14])
-        more = dim(f"\n    … (+{len(content.splitlines()) - 14} more lines)") if len(content.splitlines()) > 14 else ""
-        return f"{green('create')} {bold(str(args.get('path', '?')))}\n{preview}{more}"
+        lines = content.splitlines()
+        preview = green("+ " + lines[0]) if lines else ""
+        more = dim(f" +{len(lines)} lines") if len(lines) > 1 else ""
+        return dim(f"  {green('create')} {bold(str(args.get('path', '?')))} {preview}{more}")
     if name == "run_bash":
-        return f"{yellow('run')}\n    {bold(str(args.get('command', '')))}"
-    return f"{blue(name)} {dim(str(args))}"
+        return dim(f"  {yellow('run')} {bold(str(args.get('command', '')))}")
+    if name in ("read_file",):
+        return dim(f"  {blue('read')} {bold(str(args.get('path', '?')))}")
+    return dim(f"  {blue(name)} {dim(str(args))}")
 
 
 def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
@@ -675,7 +681,8 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
         sp = spinner if docked else None
         if not docked:
             spinner.pause()
-        _say(session, "meta", _confirm_preview(name, args, reason), sp)
+        if name in ("edit_file", "create_file"):
+            _say(session, "meta", _confirm_preview(name, args, reason), sp)
         if _auto_approves(state.approval_mode, name, reason):
             if not docked:
                 spinner.resume()
@@ -863,7 +870,7 @@ def cmd_compact(state: State, args: str) -> None:
          "Preserve all decisions, facts, and file paths. Use the same style the user would."}
     ]
 
-    spinner = Spinner()
+    spinner = Spinner(state)
     spinner.start("compacting")
     t0 = time.monotonic()
     try:
