@@ -70,7 +70,6 @@ class Config:
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
     temperature: float = 0.3
-    max_tool_iters: int = 12
     approval_mode: str = "confirm"
     balance: float | None = None  # cached from /user/balance
     home: Path = field(default_factory=lambda: Path(os.environ.get("HRNS_HOME", Path.home() / ".hrns")))
@@ -98,7 +97,6 @@ class Config:
         cfg.base_url = saved.get("base_url", cfg.base_url)
         cfg.model = saved.get("model", cfg.model)
         cfg.temperature = saved.get("temperature", cfg.temperature)
-        cfg.max_tool_iters = saved.get("max_tool_iters", cfg.max_tool_iters)
         cfg.approval_mode = saved.get("approval_mode", cfg.approval_mode)
 
         dotenv = _load_dotenv(Path.cwd() / ".env")
@@ -122,7 +120,6 @@ class Config:
             "base_url": self.base_url,
             "model": self.model,
             "temperature": self.temperature,
-            "max_tool_iters": self.max_tool_iters,
             "approval_mode": self.approval_mode,
         })
         if include_key:

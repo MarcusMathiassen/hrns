@@ -521,7 +521,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     interrupted = False
 
     try:
-        for _ in range(cfg.max_tool_iters):
+        while True:
             buf: list[str] = []
             out_tok = 0
 
@@ -570,8 +570,6 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                         _say(session, "meta", dim(f"    -> {preview}"), spinner)
                 session.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
             # loop so the model can read the tool results
-        else:
-            final_text = final_text or f"_Stopped after {cfg.max_tool_iters} tool steps._"
     except KeyboardInterrupt:
         interrupted = True
     finally:
@@ -959,7 +957,14 @@ def _model_name(model: str) -> str:
 
 
 def _location_info() -> str:
-    """Short cwd + git branch and dirty status, or empty string."""
+    """Short cwd + git branch and dirty status, or empty string.
+    Cached for 5s to avoid spawning git on every keystroke.
+    """
+    _cache = getattr(_location_info, "_cache", None)
+    _ts = getattr(_location_info, "_ts", 0.0)
+    now = time.monotonic()
+    if _cache is not None and now - _ts < 5.0:
+        return _cache
     try:
         cwd = Path.cwd()
         home = Path.home()
@@ -974,7 +979,10 @@ def _location_info() -> str:
             capture_output=True, text=True, timeout=1,
         ).stdout.strip()
         if not branch:
-            return dim(str(cwd_short))
+            result = dim(str(cwd_short))
+            _location_info._cache = result
+            _location_info._ts = now
+            return result
 
         status = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -982,19 +990,36 @@ def _location_info() -> str:
         ).stdout
         dirty = ""
         if status:
-            lines = status.splitlines()
-            staged = sum(1 for l in lines if l[0] != " ")
-            unstaged = sum(1 for l in lines if l[0] == " " and l[1] != " ")
+            staged = 0
+            unstaged = 0
+            untracked = 0
+            for l in status.splitlines():
+                if len(l) < 2:
+                    continue
+                if l.startswith("??"):
+                    untracked += 1
+                elif l[0] != " ":
+                    staged += 1
+                elif l[1] != " ":
+                    unstaged += 1
             parts = []
             if staged:
                 parts.append(f"+{staged}")
             if unstaged:
                 parts.append(f"-{unstaged}")
+            if untracked:
+                parts.append(f"?{untracked}")
             dirty = " " + "/".join(parts) if parts else " *"
 
-        return dim(f"{cwd_short} · {branch}{dirty}")
+        result = dim(f"{cwd_short} · {branch}{dirty}")
+        _location_info._cache = result
+        _location_info._ts = now
+        return result
     except Exception:
-        return ""
+        result = ""
+        _location_info._cache = result
+        _location_info._ts = now
+        return result
 
 
 def statusline(state: State) -> str:
@@ -1225,26 +1250,6 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
     saved = termios.tcgetattr(fd)
     keys = _keys()
     ed = LineEditor(initial)
-    _suggestions: str = ""  # dim line shown above input when tab-completing
-
-    def _complete() -> None:
-        nonlocal _suggestions
-        text = ed.text()
-        if not text.startswith("/") or " " in text:
-            _suggestions = ""
-            return
-        prefix = text[1:]  # without the leading /
-        cmds = sorted(cmd for cmd in COMMANDS if cmd.startswith("/" + prefix))
-        if not cmds:
-            _suggestions = ""
-            return
-        if len(cmds) == 1:
-            ed.set_text(cmds[0])
-            _suggestions = ""
-            return
-        # multiple matches — show them
-        names = "  ".join(cmd for cmd in cmds)
-        _suggestions = names
 
     def redraw() -> None:
         parts: list[str] = []
@@ -1253,31 +1258,28 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
         ghost = _command_ghost(ed.text())
         if rows == 0:                     # terminal too short — inline prompt
             parts.append("\r\033[K" + prompt_fn() + ed.text() + dim(ghost))
+            cursor_offset = len(ed.buf) - ed.cursor + len(ghost)
         else:
             top = rows - 2
             head = mode_badge(state.approval_mode).strip() + dim(" · ") + statusline(state)
             parts.append("\033[?25h")
             parts.append(f"\033[{top};1H\033[K" + _box_top(head))
-            if _suggestions:
-                parts.append(f"\033[{top + 1};1H\033[K" + dim("  " + _suggestions))
-                inp_row = top + 2
-                bot_row = top + 3
-            else:
-                inp_row = top + 1
-                bot_row = top + 2
+            inp_row = top + 1
+            bot_row = top + 2
             parts.append(f"\033[{bot_row};1H\033[K" + _box_bottom())
             # the input row is drawn last so the cursor parks inside the box
             text_display = ed.text()
-            nl = text_display.count("\n")
-            if nl:
+            if "\n" in text_display:
                 first = text_display.split("\n")[0]
+                nl = text_display.count("\n")
                 text_display = first + dim(f" +{nl} more line{'s' if nl > 1 else ''}")
                 ghost = ""                # display text no longer maps to buf
+                cursor_offset = 0
+            else:
+                cursor_offset = len(ed.buf) - ed.cursor + len(ghost)
             parts.append(f"\033[{inp_row};1H\033[K" + _box_mid(text_display + dim(ghost)))
-        # step back over the ghost (it sits after the real text) + cursor offset
-        n = len(ed.buf) - ed.cursor + len(ghost)
-        if n > 0:
-            parts.append(f"\033[{n}D")    # cursor back from end to position
+        if cursor_offset > 0:
+            parts.append(f"\033[{cursor_offset}D")
         sys.stdout.write("".join(parts))
         sys.stdout.flush()
 
@@ -1302,7 +1304,6 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
                 raise EOFError
             act = ed.handle(ch, lambda: keys.getch(0.05))
             if act == "submit":
-                _suggestions = ""
                 text = ed.text()
                 # clear the input row, then echo the line into the flow (bold)
                 if _Dock.active:
@@ -1458,13 +1459,19 @@ class TypeAhead:
             cur = self._editor.cursor
         prompt = req if req is not None else ""
         plain_len = len(_ANSI.sub("", prompt))
+        # Flatten newlines so windowing works on a single terminal row
+        display_text = text.replace("\n", " ")
+        # Adjust cursor: newlines before cursor aren't visible chars
+        display_cur = cur - text[:cur].count("\n")
+        # Cap at display length (cursor can't be past the flattened text)
+        display_cur = min(display_cur, len(display_text))
         # window the draft so the cursor stays visible on one terminal row
         width = max(10, shutil.get_terminal_size().columns - plain_len - 5)
         start = 0
-        if len(text) >= width:
-            start = min(max(0, cur - width + 1), len(text) - width)
-        visible = text[start:start + width]
-        vcur = cur - start
+        if len(display_text) >= width:
+            start = min(max(0, display_cur - width + 1), len(display_text) - width)
+        visible = display_text[start:start + width]
+        vcur = display_cur - start
         ghost = ""
         if req is None and cur == len(text):
             # faded preview of the first matching /command, kept on this row
