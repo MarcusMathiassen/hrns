@@ -55,6 +55,10 @@ environment or a project-local `.env`.
 
 ## Commands
 
+Command names **Tab-complete** at the prompt: a unique prefix completes fully
+(`/se⇥` → `/sessions `), an ambiguous one extends as far as possible and a
+second ⇥ lists the candidates.
+
 | Command | What it does |
 |---|---|
 | `/connect` | Configure & test the DeepSeek connection (key, base URL, model) — **remembered for next run** |
@@ -65,6 +69,36 @@ environment or a project-local `.env`.
 | `/mode` | Cycle approval mode: confirm → auto-edit → auto (or **Shift+Tab**) |
 | `/stats` | Cumulative tokens, cache-hit rate, and cost (with cache savings) |
 | `/help`, `/quit` | … |
+
+### Type while it thinks — the prompt never blocks
+
+The input box is **pinned to the bottom of the terminal** (a scroll region
+keeps all output above it), idle or mid-reasoning alike. Its top border shows
+the approval mode plus the session vitals — or the live spinner while a turn
+runs — and you type inside it:
+
+```
+  …replies, diffs, and tool calls scroll here…
+
+┌─ auto · deepseek-chat · 95.0% · 3 turns · 12.3k · $0.01 · $10.00
+│ your next prompt, typed even while it works…
+└─
+```
+
+Press **Enter** to queue the draft — queued prompts run in order as soon as
+the current turn finishes, and anything left half-typed pre-fills the next
+prompt. **Ctrl-C** interrupts the current turn:
+partial progress is saved, and any tool calls that never ran are answered with
+placeholders so the append-only message log stays valid.
+
+The scrollback shows what matters: your words (bold, `› `-prefixed), replies
+(cyan `⏺`), one dim `•` line per tool call, edit diffs/previews, and a single
+cache/cost summary per turn — no per-call token chatter.
+
+Every session also remembers its on-screen transcript: resuming one (auto on
+start, or via `/sessions <id|#>`) replays the conversation **exactly** as you
+left it — tool calls, diffs, and all. The transcript is display-only and
+never sent to the API, so it cannot disturb the cached prefix.
 
 ## Tools
 

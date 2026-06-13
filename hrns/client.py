@@ -85,6 +85,7 @@ class DeepSeekClient:
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
+            "prefix": True,
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": temperature,
@@ -168,4 +169,10 @@ class DeepSeekClient:
                 }
                 for _, slot in sorted(tool_calls.items())
             ]
+        elif message["content"] is None:
+            # An empty stream (e.g. a reasoning-only response) must not produce
+            # content=null with no tool_calls: the API rejects that message on
+            # every later request ("content or tool_calls must be set"), which
+            # would poison the append-only log for good.
+            message["content"] = ""
         return ChatResult(message=message, usage=usage, finish_reason=finish_reason)

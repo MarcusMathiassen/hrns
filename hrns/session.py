@@ -13,7 +13,8 @@ as immutable and append-only:
     DeepSeek's on-disk cache.
   * Because the log is persisted byte-for-byte, RESUMING a session days later
     still replays an identical prefix and still hits the cache (within DeepSeek's
-    cache TTL of hours-to-days).
+    cache TTL of ~5 minutes for the underlying storage, though fresh cache writes
+    reset the clock each time the prefix is re-sent).
   * Volatile data (timestamps, "today is...") is kept OUT of the prefix so it
     never invalidates the cache.
 
@@ -46,6 +47,12 @@ class Session:
     created_at: str
     updated_at: str
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # everything the user saw, as rendered lines — replayed verbatim on resume
+    # so a loaded session looks exactly like it did when they left it.
+    # Entries: {"kind": "user"|"assistant"|"meta", "text": <rendered line(s)>}
+    # LOCAL DISPLAY ONLY: never sent to the API — requests send `messages`
+    # alone, so the transcript cannot disturb the cached prefix.
+    transcript: list[dict[str, Any]] = field(default_factory=list)
     # cumulative, append-only counters
     usage: dict[str, int] = field(
         default_factory=lambda: {
@@ -80,9 +87,19 @@ class Session:
             created_at=data.get("created_at", _now()),
             updated_at=data.get("updated_at", _now()),
             messages=data.get("messages", []),
+            transcript=data.get("transcript", []),
         )
         s.usage.update(data.get("usage", {}))
         s.context_tokens = int(data.get("context_tokens", 0) or 0)
+        # Heal logs poisoned by an empty stream before the client guarded
+        # against it: an assistant message with neither content nor tool_calls
+        # is rejected by the API ("content or tool_calls must be set"), so
+        # every request containing it 400s. Setting content to "" makes the
+        # log valid again at the cost of one cache miss on the next turn.
+        for m in s.messages:
+            if (m.get("role") == "assistant"
+                    and m.get("content") is None and not m.get("tool_calls")):
+                m["content"] = ""
         return s
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +109,7 @@ class Session:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "messages": self.messages,
+            "transcript": self.transcript,
             "usage": self.usage,
             "context_tokens": self.context_tokens,
         }
@@ -100,6 +118,10 @@ class Session:
     def append(self, message: dict[str, Any]) -> None:
         self.messages.append(message)
         self.updated_at = _now()
+
+    def log(self, kind: str, text: str) -> None:
+        """Record a rendered line exactly as the user saw it."""
+        self.transcript.append({"kind": kind, "text": text})
 
     def record_usage(self, usage: dict[str, Any]) -> None:
         if not usage:
