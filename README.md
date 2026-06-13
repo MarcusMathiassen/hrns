@@ -8,6 +8,14 @@ already cached.
 
 Zero dependencies — pure Python standard library.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MarcusMathiassen/hrns/main/install.sh | sh
+```
+
+Requires Python 3.12+ and either `curl` or `wget`. Installs to your user site-packages (`pip install --user`).
+
 ## The caching strategy
 
 DeepSeek's [context caching](https://api-docs.deepseek.com/guides/kv_cache) is
