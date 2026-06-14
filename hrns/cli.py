@@ -1039,7 +1039,7 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
     if name == "run_bash":
         return dim(f"  {yellow('run')} {bold(str(args.get('command', '')))}")
     if name == "save_memory":
-        return dim(f"  {magenta('memory')} {dim(str(args.get('text', ''))[:120])}")
+        return magenta("  ✦ ") + magenta(bold("remembering ")) + str(args.get("text", ""))[:100]
     if name in ("read_file",):
         return dim(f"  {blue('read')} {bold(str(args.get('path', '?')))}")
     return dim(f"  {blue(name)} {dim(str(args))}")
