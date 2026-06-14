@@ -28,12 +28,34 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 MAX_OUTPUT = 12_000      # cap any tool result (chars) to keep context/cost bounded
 MAX_READ_LINES = 2_000   # default read window
+
+
+def _kill_process_group(proc: subprocess.Popen, timeout: int) -> None:
+    """Kill a process and all its children, then wait for cleanup."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # gave it our best shot
+
 MAX_LINE_LEN = 2_000     # truncate pathological single lines
 GREP_CAP = 200           # max match lines returned
 GLOB_CAP = 200           # max paths returned
@@ -408,13 +430,21 @@ def _grep(args: dict) -> str:
         if glob_filter:
             cmd += ["--glob", str(glob_filter)]
         cmd += ["--", pattern, str(_resolve(path))]
+        proc = None
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            proc = subprocess.Popen(
+                cmd, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            out, err = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
+            if proc is not None:
+                _kill_process_group(proc, 5)
             return "ERROR: grep timed out after 30s"
         if proc.returncode > 1:  # 0=matches, 1=no matches, >1=error
-            return f"ERROR (ripgrep): {(proc.stderr or '').strip()[:300]}"
-        lines = (proc.stdout or "").splitlines()
+            return f"ERROR (ripgrep): {(err or '').strip()[:300]}"
+        lines = (out or "").splitlines()
     else:
         try:
             rx = re.compile(pattern, re.IGNORECASE if ci else 0)
@@ -494,15 +524,23 @@ def _create_file(args: dict) -> str:
 def _run_bash(args: dict) -> str:
     cmd = str(args["command"])
     timeout = min(max(1, int(args.get("timeout", 120) or 120)), 600)
+    proc = None
     try:
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.Popen(
+            cmd, shell=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        if proc is not None:
+            _kill_process_group(proc, 5)
         return f"ERROR: `{cmd}` timed out after {timeout}s"
     except Exception as e:  # noqa: BLE001
         return f"ERROR running `{cmd}`: {e}"
-    out = (proc.stdout or "") + (proc.stderr or "")
+    out_text = (out or "") + (err or "")
     status = "exit 0" if proc.returncode == 0 else f"exit {proc.returncode}"
-    return _truncate(f"[{status}]\n{out}".rstrip())
+    return _truncate(f"[{status}]\n{out_text}".rstrip())
 
 
 # --- memory path, set by the CLI on startup --------------------------
