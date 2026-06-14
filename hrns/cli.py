@@ -88,9 +88,9 @@ def _divider() -> str:
 
 
 # --- the input box (drawn inside the bottom dock) -----------------------
-#   ┌─ auto · deepseek-chat · 95.0% · 3 turns · 12.3k · $0.01 · $10.00
+#   ┌─ ⠋ 3s · $0.000042 · 12.3k · reasoning
 #   │ the user types in here
-#   └─
+#   └─ hrns · main · +2 -1 · chat · 95.0% · $0.01 · $10.00 · 12.3k ctx / 48k cum · … · auto
 def _box_top(content: str) -> str:
     return dim("┌─ ") + content
 
@@ -99,46 +99,194 @@ def _box_mid(content: str) -> str:
     return dim("│ ") + content
 
 
-def _box_bottom() -> str:
+def _box_bottom(content: str = "") -> str:
+    if content:
+        return dim("└─ ") + content
     return dim("└─")
+
+
+def _layout(text: str, cursor: int, width: int) -> "tuple[list[str], int, int]":
+    """Lay `text` out into display rows of at most `width` columns — wrapping
+    long logical lines and honoring embedded newlines — and locate the cursor.
+
+    Returns (rows, cursor_row, cursor_col). A cursor sitting exactly on a wrap
+    boundary belongs to column 0 of the following row, and a trailing newline
+    yields a final empty row so the cursor stays visible after it."""
+    width = max(1, width)
+    rows: list[str] = []
+    cur_row = cur_col = 0
+    idx = 0                                   # global index of the line's start
+    for line in text.split("\n"):
+        start = 0
+        while True:
+            chunk = line[start:start + width]
+            lo = idx + start                  # global index of the chunk's head
+            hi = lo + len(chunk)
+            more = start + width < len(line)  # this logical line wraps further
+            if lo <= cursor <= hi and not (more and cursor == hi):
+                cur_row, cur_col = len(rows), cursor - lo
+            rows.append(chunk)
+            if not more:
+                break
+            start += width
+        idx += len(line) + 1                  # +1 for the consumed newline
+    return rows, cur_row, cur_col
 
 
 # --- the bottom dock ----------------------------------------------------
 class _Dock:
-    """The 3-row UI pinned to the bottom of the terminal.
+    """The UI pinned to the bottom of the terminal: a top status border, one
+    or more input rows, and a bottom border.
 
     A DECSTBM scroll region confines normal output to the rows above, so
     replies and meta scroll there while the status row, divider, and input
-    field stay put on the screen's last three rows — even mid-reasoning.
+    field stay put on the screen's last rows — even mid-reasoning. The dock
+    grows and shrinks as the input field gains and loses lines (see
+    `_dock_ensure`), so a pasted or multi-line draft is shown in full.
     """
     active = False
-    rows = 0
+    rows = 0          # terminal row count when the dock was last established
+    height = 3        # dock rows: top border + N input rows + bottom border
 
 
-def _dock_ensure(parts: list[str]) -> int:
-    """Append the escapes that (re)establish the dock. Returns the terminal
-    row count, or 0 when the terminal is too short to dock."""
+def _dock_ensure(parts: list[str], height: int = 3) -> int:
+    """Append the escapes that (re)establish the dock at `height` rows (≥3:
+    top border + ≥1 input rows + bottom border), growing or shrinking it in
+    place. Returns the terminal row count, or 0 when the terminal is too short
+    to dock."""
     size = shutil.get_terminal_size()
     if size.lines < 8:
         return 0
-    if _Dock.active and _Dock.rows == size.lines:
+    height = max(3, min(height, size.lines - 5))   # keep some flow visible
+    if _Dock.active and _Dock.rows == size.lines and _Dock.height == height:
         return size.lines
-    if _Dock.active:                      # resized — release the old margins
-        parts.append("\0337\033[r\0338")
-    parts.append("\n\n\n\033[3A")         # free the bottom rows (scroll if needed)
-    parts.append("\0337" + f"\033[1;{size.lines - 3}r" + "\0338")
+    if _Dock.active and _Dock.rows == size.lines:
+        _dock_reflow(parts, _Dock.height, height, size.lines)
+    else:
+        if _Dock.active:                  # resized — release the old margins
+            parts.append("\0337\033[r\0338")
+        parts.append("\n" * height + f"\033[{height}A")   # free the bottom rows
+        parts.append("\0337" + f"\033[1;{size.lines - height}r" + "\0338")
     _Dock.active = True
     _Dock.rows = size.lines
+    _Dock.height = height
     return size.lines
+
+
+def _dock_reflow(parts: list[str], old: int, new: int, lines: int) -> None:
+    """Resize the dock from `old` to `new` rows on the same terminal. Growth
+    scrolls the flow up so its tail slides into scrollback; shrink scrolls it
+    back down to fill the rows the dock gives up. Either way the cursor is left
+    on the flow's last usable row (just above the new dock) so a following
+    print lands correctly."""
+    delta = new - old
+    parts.append("\033[r")                     # full screen, so the scroll lands
+    if delta > 0:
+        parts.append(f"\033[{lines};1H" + "\n" * delta)   # bottom: scroll up
+    else:
+        parts.append("\033[1;1H" + "\033M" * (-delta))    # top: scroll down
+    parts.append(f"\033[1;{lines - new}r")     # re-pin the resized flow region
+    parts.append(f"\033[{lines - new};1H")     # park on the flow's last row
 
 
 def _undock() -> None:
     """Clear the docked rows and release the scroll margins (on exit)."""
     if not _Dock.active:
         return
-    sys.stdout.write(f"\0337\033[{_Dock.rows - 2};1H\033[J\033[r\0338\033[?25h")
+    top = _Dock.rows - _Dock.height + 1
+    sys.stdout.write(f"\0337\033[{top};1H\033[J\033[r\0338\033[?25h")
     sys.stdout.flush()
     _Dock.active = False
+
+
+def _block(row: str, col: int, ghost: str = "") -> str:
+    """Render `row` with an inverse-video block standing in for the hardware
+    cursor at `col` (used while the hw cursor is hidden in the flow). Past the
+    end of `row` the block sits on the first ghost char, or on a trailing
+    space."""
+    if col < len(row):
+        return row[:col] + _c("7", row[col]) + row[col + 1:]
+    if ghost:
+        return row + _c("7", ghost[0]) + dim(ghost[1:])
+    return row + _c("7", " ")
+
+
+def _confirm_body(prompt: str, text: str, cursor: int, cols: int) -> str:
+    """One-row body for a confirm question borrowing the field: the question,
+    then the typed answer windowed so the cursor stays on screen, with an
+    inverse block cursor."""
+    plain_len = len(_ANSI.sub("", prompt))
+    disp = text.replace("\n", " ")
+    dcur = min(cursor - text[:cursor].count("\n"), len(disp))
+    width = max(10, cols - plain_len - 5)
+    start = 0
+    if len(disp) >= width:
+        start = min(max(0, dcur - width + 1), len(disp) - width)
+    visible = disp[start:start + width]
+    return prompt + ("…" if start else "") + _block(visible, dcur - start)
+
+
+def _paint_input_box(parts: list[str], head: str, text: str, cursor: int,
+                     *, prompt: str = "", block_cursor: bool = False,
+                     foot: str = "") -> int:
+    """Draw the bottom input dock — `head` on the top border, the field body,
+    then `foot` on the bottom border — growing the dock to fit. Returns the
+    terminal row count, or 0 when the terminal is too short (caller falls back
+    to an inline prompt).
+
+    Without `prompt` the body is `text` wrapped across as many input rows as it
+    needs, so a multi-line or pasted draft shows in full. With `prompt` (a
+    confirm question borrowing the field) the body stays on one row.
+
+    block_cursor=True draws the cursor cell inverse-video and leaves the hw
+    cursor hidden (during-turn type-ahead); False parks the visible hw cursor
+    at the cell (interactive prompt)."""
+    size = shutil.get_terminal_size()
+    cols, lines = size.columns, size.lines
+    ghost = ""
+    if prompt:
+        rows: list[str] = [_confirm_body(prompt, text, cursor, cols)]
+        cur_row = cur_col = 0
+    else:
+        width = max(8, cols - 2)              # the "│ " mid-row prefix is 2 cols
+        rows, cur_row, cur_col = _layout(text, cursor, width)
+        if len(rows) == 1 and cursor == len(text):   # faded /command preview
+            ghost = _command_ghost(text)[:max(0, width - len(rows[0]))]
+
+    max_in = max(1, lines - 7)                # most input rows the dock can show
+    if len(rows) > max_in:                    # window so the cursor stays shown
+        start = min(max(0, cur_row - max_in + 1), len(rows) - max_in)
+        rows, cur_row = rows[start:start + max_in], cur_row - start
+
+    rows_n = _dock_ensure(parts, len(rows) + 2)
+    if rows_n == 0:
+        return 0
+    if len(rows) > _Dock.height - 2:          # dock capped tighter than asked
+        keep = _Dock.height - 2
+        start = min(max(0, cur_row - keep + 1), len(rows) - keep)
+        rows, cur_row = rows[start:start + keep], cur_row - start
+    top = rows_n - _Dock.height + 1           # the top-border row
+    # block_cursor: hide the hw cursor and stash the flow spot (so the turn's
+    # next print lands there); the field paints its own inverse block. Hide
+    # BEFORE saving — some terminals fold visibility into the DECSC state, so a
+    # save-then-hide gets undone by every later restore.
+    parts.append("\033[?25l\0337" if block_cursor else "\033[?25h")
+    parts.append(f"\033[{top};1H\033[K" + _box_top(head))
+    for i, row in enumerate(rows):
+        g = ghost if i == len(rows) - 1 else ""
+        if prompt:
+            body = row                        # block already embedded
+        elif block_cursor and i == cur_row:
+            body = _block(row, cur_col, g)
+        else:
+            body = row + (dim(g) if g else "")
+        parts.append(f"\033[{top + 1 + i};1H\033[K" + _box_mid(body))
+    parts.append(f"\033[{rows_n};1H\033[K" + _box_bottom(foot))
+    if block_cursor:
+        parts.append("\0338")                 # hw cursor back to the flow
+    else:
+        parts.append(f"\033[{top + 1 + cur_row};{3 + cur_col}H")   # park on cell
+    return rows_n
 
 
 # --- "working…" spinner with an elapsed timer -------------------------
@@ -149,14 +297,14 @@ class Spinner:
     what's happening ("thinking", "reading config.py"). The whole noisy
     intermediate stream (reasoning, tool I/O) is collapsed into the status row.
 
-    When `input_line` is set (type-ahead active), it paints the input box
-    into the bottom dock:
+    When `input_state` is set (type-ahead active), it paints the input box
+    into the bottom dock, growing it to fit a multi-line draft:
 
         ┌─ auto · ⠋ reasoning 3s [1 queued]   <- mode (via `lead`) + status
-        │ the user's draft                     <- input row, block cursor
+        │ the user's draft                     <- input row(s), block cursor
         └─
 
-    Without `input_line` it degrades to the classic single status row.
+    Without `input_state` it degrades to the classic single status row.
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -178,8 +326,12 @@ class Spinner:
         self.extra: Optional[Callable[[], str]] = None
         # leading segment on the box's top border (the approval mode)
         self.lead: Optional[Callable[[], str]] = None
-        # when set, renders the input box's middle row
-        self.input_line: Optional[Callable[[], str]] = None
+        # when set, supplies the input field's (text, cursor, confirm_prompt)
+        self.input_state: Optional[Callable[[], "tuple[str, int, Optional[str]]"]] = None
+        # prompt token count accumulated during this turn (set from run_turn)
+        self.prompt_tokens: Optional[int] = None
+        # prompt cost accumulated during this turn (set from run_turn)
+        self.prompt_cost: Optional[float] = None
 
     def start(self, label: str = "working") -> None:
         self._label = label
@@ -195,6 +347,12 @@ class Spinner:
         with self._lock:
             self._label = label
 
+    def set_prompt_tokens(self, n: int) -> None:
+        self.prompt_tokens = n
+
+    def set_prompt_cost(self, c: float) -> None:
+        self.prompt_cost = c
+
     def _run(self) -> None:
         for frame in itertools.cycle(self.FRAMES):
             if self._stop.is_set():
@@ -209,35 +367,36 @@ class Spinner:
             label = self._label
         extra_fn = self.extra
         extra = extra_fn() if extra_fn else ""
-        input_fn = self.input_line
+        state_fn = self.input_state
         elapsed = time.monotonic() - self._t0
-        spinner_part = f"{cyan(self._frame)} {label} {dim(f'{elapsed:.0f}s')}"
+        head = f"{cyan(self._frame)} {dim(f'{elapsed:.0f}s')}"
+        if self.prompt_cost is not None:
+            head += dim(" · ") + yellow(f"${self.prompt_cost:.6f}")
+        if self.prompt_tokens is not None:
+            head += dim(" · ") + magenta(_human(self.prompt_tokens))
+        head += dim(" · ") + label
+        if extra:
+            head += " " + extra
         with self._io:
             if self._paused.is_set() or self._stop.is_set():
                 return
-            if input_fn is None:
-                sys.stdout.write(f"\r\033[K{spinner_part}")
+            if state_fn is None:
+                sys.stdout.write(f"\r\033[K{head}")
                 sys.stdout.flush()
                 return
+            text, cursor, req = state_fn()
+            foot = statusline(self.state)
+            if self.lead:
+                foot += dim(" · ") + self.lead()
             parts: list[str] = []
-            rows = _dock_ensure(parts)
+            rows = _paint_input_box(parts, head, text, cursor,
+                                    prompt=req or "", block_cursor=True,
+                                    foot=foot)
             if rows == 0:                 # terminal too short to dock
-                sys.stdout.write(f"\r\033[K{spinner_part}  {input_fn()}")
+                flat = (req or "") + text.replace("\n", " ")
+                sys.stdout.write(f"\r\033[K{head}  {flat}")
                 sys.stdout.flush()
                 return
-            top = rows - 2
-            lead_fn = self.lead
-            head = (lead_fn() + dim(" · ") if lead_fn else "") + spinner_part + dim(" · ") + statusline(self.state) + extra
-            # hw cursor stays (hidden) in the flow so prints land there;
-            # the input row paints its own block cursor. Hide BEFORE saving:
-            # some terminals (Terminal.app, iTerm2) include visibility in the
-            # DECSC state, so save-then-hide gets undone by every restore —
-            # leaving a second, visible cursor blinking in the flow.
-            parts.append("\033[?25l\0337")
-            parts.append(f"\033[{top};1H\033[K" + _box_top(head))
-            parts.append(f"\033[{top + 1};1H\033[K" + _box_mid(input_fn()))
-            parts.append(f"\033[{top + 2};1H\033[K" + _box_bottom())
-            parts.append("\0338")
             sys.stdout.write("".join(parts))
             sys.stdout.flush()
             self._region_live = True
@@ -609,6 +768,10 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     spinner = Spinner(state)
     typeahead.start(spinner)  # attach dock hooks first so no frame paints inline
     spinner.start("calling api")
+    start_prompt_tokens = session.usage["prompt_tokens"]  # snapshot for accumulator
+    start_hit = session.usage["prompt_cache_hit_tokens"]
+    start_miss = session.usage["prompt_cache_miss_tokens"]
+    p = pricing_for(session.model)
     final_text = ""
     error: Optional[str] = None
     interrupted = False
@@ -642,6 +805,10 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
 
             session.append(result.message)
             session.record_usage(result.usage)
+            spinner.set_prompt_tokens(session.usage["prompt_tokens"] - start_prompt_tokens)
+            dh = session.usage["prompt_cache_hit_tokens"] - start_hit
+            dm = session.usage["prompt_cache_miss_tokens"] - start_miss
+            spinner.set_prompt_cost(dh / 1e6 * p["cache_hit"] + dm / 1e6 * p["cache_miss"])
 
             tool_calls = result.message.get("tool_calls")
             if not tool_calls:
@@ -815,7 +982,7 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
 
     def confirm(name: str, args: dict, reason: Optional[str] = None) -> bool:
         session = state.session
-        docked = spinner.input_line is not None
+        docked = spinner.input_state is not None
         sp = spinner if docked else None
         if not docked:
             spinner.pause()
@@ -1186,15 +1353,20 @@ def statusline(state: State) -> str:
         gparts.append(yellow(f"?{untracked}"))
 
     segs = [
+        dim(repo),                                                           # repo
+        blue(branch),                                                        # branch
+        " ".join(gparts),                                                    # git stats
         cyan(_model_name(s.model)),                                          # model
         green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),    # cache hit rate
         yellow(_money(cost)),                                                # session cost
         yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
         magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
-        dim(repo),                                                           # repo
-        blue(branch),                                                        # branch
-        " ".join(gparts),                                                    # git stats
     ]
+    # context window usage %
+    cw = context_window(s.model)
+    if cw:
+        ctx_pct = s.context_tokens / cw * 100
+        segs.append(magenta(f"{ctx_pct:.1f}%"))
     return dim(" · ").join(seg for seg in segs if seg)
 
 
@@ -1270,17 +1442,6 @@ class LineEditor:
     def set_text(self, text: str) -> None:
         self.buf = list(text)
         self.cursor = len(self.buf)
-
-    def cursor_line(self) -> "tuple[int, int, list[str]]":
-        """(line index, column within that line, all lines) for the cursor —
-        lets a one-row field show and edit the line the cursor sits on."""
-        lines = self.text().split("\n")
-        pos = self.cursor
-        for i, ln in enumerate(lines):
-            if pos <= len(ln):
-                return i, pos, lines
-            pos -= len(ln) + 1
-        return len(lines) - 1, len(lines[-1]), lines
 
     @staticmethod
     def _is_word(ch: str) -> bool:
@@ -1465,54 +1626,37 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
     keys = _keys()
     ed = LineEditor(initial)
 
+    def flow_row() -> int:
+        """1-based row of the flow's last (ready) line — just above the dock.
+        The dock grows/shrinks, so this is recomputed rather than stashed via
+        a stale cursor save."""
+        return _Dock.rows - _Dock.height
+
     def redraw() -> None:
         parts: list[str] = []
-        rows = _dock_ensure(parts)
-        # ghost preview: faded remainder of the first matching /command
-        ghost = _command_ghost(ed.text())
+        head = ""
+        foot = statusline(state) + dim(" · ") + mode_badge(state.approval_mode).strip()
+        rows = _paint_input_box(parts, head, ed.text(), ed.cursor, block_cursor=False,
+                                foot=foot)
         if rows == 0:                     # terminal too short — inline prompt
-            parts.append("\r\033[K" + prompt_fn() + ed.text() + dim(ghost))
-            cursor_offset = len(ed.buf) - ed.cursor + len(ghost)
-        else:
-            top = rows - 2
-            head = mode_badge(state.approval_mode).strip() + dim(" · ") + statusline(state)
-            parts.append("\033[?25h")
-            parts.append(f"\033[{top};1H\033[K" + _box_top(head))
-            inp_row = top + 1
-            bot_row = top + 2
-            parts.append(f"\033[{bot_row};1H\033[K" + _box_bottom())
-            # the input row is drawn last so the cursor parks inside the box
-            text_display = ed.text()
-            if "\n" in text_display:
-                # one row, many lines: show the line the cursor is on with a
-                # [n/total] tag, and park the cursor at its column within it.
-                li, col, lines = ed.cursor_line()
-                cur = lines[li]
-                text_display = dim(f"[{li + 1}/{len(lines)}] ") + cur
-                ghost = ""                # display text no longer maps to buf
-                cursor_offset = len(cur) - col
-            else:
-                cursor_offset = len(ed.buf) - ed.cursor + len(ghost)
-            parts.append(f"\033[{inp_row};1H\033[K" + _box_mid(text_display + dim(ghost)))
-        if cursor_offset > 0:
-            parts.append(f"\033[{cursor_offset}D")
+            ghost = _command_ghost(ed.text())
+            flat = ed.text().replace("\n", " ")   # no room to expand; keep it linear
+            parts.append("\r\033[K" + prompt_fn() + flat + dim(ghost))
+            after = (len(ed.buf) - ed.cursor) + len(ghost)
+            if after > 0:
+                parts.append(f"\033[{after}D")
         sys.stdout.write("".join(parts))
         sys.stdout.flush()
 
     def to_flow() -> None:
         """Put the cursor back where the scrolling flow left off."""
         if _Dock.active:
-            sys.stdout.write("\0338")
+            sys.stdout.write(f"\033[{flow_row()};1H")
             sys.stdout.flush()
 
     try:
         tty.setraw(fd)
-        parts: list[str] = []
-        _dock_ensure(parts)               # may scroll — must precede the save
-        parts.append("\0337")             # remember where the flow left off
-        sys.stdout.write("".join(parts))
-        sys.stdout.flush()
-        redraw()
+        redraw()                          # establishes/normalizes the dock
         while True:
             ch = keys.getch()
             if ch == "":                             # stdin closed — never recovers
@@ -1521,13 +1665,19 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
             act = ed.handle(ch, lambda: keys.getch(0.05))
             if act == "submit":
                 text = ed.text()
-                # clear the input row, then echo the line into the flow (bold).
-                # image paths show as compact markers, but the raw text is what
-                # we return (and what the turn turns into image attachments).
+                # clear the field's input rows, then echo the line into the flow
+                # (bold). image paths show as compact markers, but the raw text is
+                # what we return (and what the turn turns into image attachments).
                 shown = bold(_input_display(text))
                 if _Dock.active:
-                    sys.stdout.write(f"\033[{_Dock.rows - 1};1H\033[K" + _box_mid("")
-                                     + "\0338\r\n" + prompt_fn() + shown + "\r\n")
+                    flow = flow_row()
+                    # input rows sit two below the flow's last row (top border
+                    # is at flow+1); blank them so the draft doesn't flash on
+                    # while the spinner repaints a collapsed dock for the turn.
+                    clear = "".join(f"\033[{flow + 2 + i};1H\033[K" + _box_mid("")
+                                    for i in range(_Dock.height - 2))
+                    sys.stdout.write(clear + f"\033[{flow};1H"
+                                     + "\r\n" + prompt_fn() + shown + "\r\n")
                 else:
                     sys.stdout.write("\r\033[K" + prompt_fn() + shown + "\r\n")
                 sys.stdout.flush()
@@ -1547,13 +1697,17 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
                 if matches:                          # ambiguous — list candidates
                     listing = dim("  " + "  ".join(matches))
                     if _Dock.active:
-                        # print into the flow above the box, then re-save it
-                        sys.stdout.write("\0338" + listing + "\r\n\0337")
+                        # print into the flow above the box (the next redraw repaints)
+                        sys.stdout.write(f"\033[{flow_row()};1H" + listing + "\r\n")
                     else:
                         sys.stdout.write("\r\n" + listing + "\r\n")
             elif act == "clear-screen":
-                sys.stdout.write("\033[2J\033[H\0337")  # re-save the flow spot
-            redraw()
+                sys.stdout.write("\033[r\033[2J\033[H")   # reset region, wipe, home
+                _Dock.active = False                       # rebuild the dock fresh
+            # coalesce: while a paste still has bytes buffered, defer the repaint
+            # so the field redraws (and the dock reflows) once, not per character
+            if not keys.ready(0):
+                redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
@@ -1634,7 +1788,7 @@ class TypeAhead:
         self._spinner = spinner
         spinner.extra = self._badge          # queued count, on the status row
         spinner.lead = lambda: mode_badge(self.state.approval_mode).strip()
-        spinner.input_line = self._input_row  # the input box's middle row
+        spinner.input_state = self._input_state   # (text, cursor, confirm prompt)
         fd = sys.stdin.fileno()
         self._saved = termios.tcgetattr(fd)
         tty.setcbreak(fd)
@@ -1652,7 +1806,7 @@ class TypeAhead:
         if self._spinner is not None:
             self._spinner.extra = None
             self._spinner.lead = None
-            self._spinner.input_line = None
+            self._spinner.input_state = None
             self._spinner = None
 
     def take_text(self) -> str:
@@ -1706,41 +1860,12 @@ class TypeAhead:
             return "  " + yellow(f"[editing {editing + 1}/{queued}]")
         return ("  " + yellow(f"[{queued} queued]")) if queued else ""
 
-    def _input_row(self) -> str:
-        """The input box's middle-row content: the draft (or a confirm
-        question + answer), with an inverse-video block standing in for the
-        hardware cursor (which stays hidden in the flow while a turn runs)."""
+    def _input_state(self) -> "tuple[str, int, Optional[str]]":
+        """The field's (text, cursor, confirm_prompt) for the spinner to paint.
+        While a confirm question borrows the field, `confirm_prompt` is the
+        question and `text` is the typed answer."""
         with self._lock:
-            req = self._req_prompt
-            text = self._editor.text()
-            cur = self._editor.cursor
-        prompt = req if req is not None else ""
-        plain_len = len(_ANSI.sub("", prompt))
-        # Flatten newlines so windowing works on a single terminal row
-        display_text = text.replace("\n", " ")
-        # Adjust cursor: newlines before cursor aren't visible chars
-        display_cur = cur - text[:cur].count("\n")
-        # Cap at display length (cursor can't be past the flattened text)
-        display_cur = min(display_cur, len(display_text))
-        # window the draft so the cursor stays visible on one terminal row
-        width = max(10, shutil.get_terminal_size().columns - plain_len - 5)
-        start = 0
-        if len(display_text) >= width:
-            start = min(max(0, display_cur - width + 1), len(display_text) - width)
-        visible = display_text[start:start + width]
-        vcur = display_cur - start
-        ghost = ""
-        if req is None and cur == len(text):
-            # faded preview of the first matching /command, kept on this row
-            ghost = _command_ghost(text)[:max(0, width - len(visible))]
-        if vcur < len(visible):
-            body = visible[:vcur] + _c("7", visible[vcur]) + visible[vcur + 1:]
-        elif ghost:
-            # the block cursor sits on the first suggested char, rest faded
-            body = visible + _c("7", ghost[0]) + dim(ghost[1:])
-        else:
-            body = visible + _c("7", " ")
-        return prompt + ("…" if start else "") + body
+            return self._editor.text(), self._editor.cursor, self._req_prompt
 
     # --- reader thread ----------------------------------------------------
     def _run(self) -> None:
@@ -1768,6 +1893,15 @@ class TypeAhead:
                 self._req_done.set()
             elif act in ("interrupt", "eof"):
                 self._req_done.set()                  # empty answer = decline
+            elif act == "edit":
+                # Single-char confirm (y/d/a/n) auto-submits without Enter
+                # and clears the input field so the key feels instant.
+                with self._lock:
+                    txt = self._editor.text().strip()
+                    if len(txt) == 1 and txt in "ydan":
+                        self._editor.set_text("")
+                        self._req_text = txt
+                        self._req_done.set()
             if self._spinner:
                 self._spinner.render_now()
             return
