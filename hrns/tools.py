@@ -30,7 +30,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 MAX_OUTPUT = 12_000      # cap any tool result (chars) to keep context/cost bounded
 MAX_READ_LINES = 2_000   # default read window
@@ -228,6 +228,37 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "timeout": {"type": "integer", "description": "Seconds before the command is killed. Default 120, max 600."},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Save a fact, preference, convention, or pattern the user has "
+                "expressed to persistent cross-session memory. Applies to FUTURE "
+                "sessions only — it does NOT modify the current conversation. The "
+                "user can view, remove, or clear memories with /memory commands. "
+                "Use sparingly: only save things the user explicitly stated they "
+                "want remembered, or clear recurring preferences/patterns they've "
+                "demonstrated across multiple turns. Do NOT save one-off requests, "
+                "temporary context, or speculative inferences."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "The fact to remember, in 1-2 concise sentences. "
+                            "Write in third person about the user. "
+                            'E.g. "The user prefers TypeScript over JavaScript." '
+                            'or "The user uses pytest for testing in all Python projects."'
+                        ),
+                    },
+                },
+                "required": ["text"],
             },
         },
     },
@@ -474,6 +505,24 @@ def _run_bash(args: dict) -> str:
     return _truncate(f"[{status}]\n{out}".rstrip())
 
 
+# --- memory path, set by the CLI on startup --------------------------
+MEMORY_PATH: Optional[Path] = None
+
+
+def _save_memory(args: dict) -> str:
+    """Save a fact or preference to persistent memory for future sessions.
+    Does NOT alter the current session's system prompt, so the prefix cache
+    is never invalidated."""
+    text = str(args.get("text", "")).strip()
+    if not text:
+        return "ERROR: memory text must not be empty."
+    from hrns import memory
+    if MEMORY_PATH is None:
+        return "ERROR: memory path is not configured."
+    note = memory.add(MEMORY_PATH, text)
+    return f"Saved memory {note['id']}: {text[:120]}"
+
+
 _DISPATCH: dict[str, Callable[[dict], str]] = {
     "read_file": _read_file,
     "list_dir": _list_dir,
@@ -482,6 +531,7 @@ _DISPATCH: dict[str, Callable[[dict], str]] = {
     "edit_file": _edit_file,
     "create_file": _create_file,
     "run_bash": _run_bash,
+    "save_memory": _save_memory,
 }
 
 

@@ -46,6 +46,7 @@ from hrns.tools import (
     set_workspace_root,
     workspace_root,
 )
+import hrns.tools as tools
 
 # --- ANSI styling (degrades to no-op if not a tty) --------------------
 _TTY = sys.stdout.isatty()
@@ -571,6 +572,7 @@ working inside the user's project in the current working directory.
 - edit_file — change a file via an exact, unique string replacement.
 - create_file — add a new file.
 - run_bash — run builds, tests, git, and other shell commands. Always preface the command with a one-liner explaining why it needs to run (e.g. "check the build passes" or "verify no regressions").
+- save_memory — save a persistent fact or preference for future sessions (applies to new sessions only, never the current one).
 
 # How to work
 - Explore before you act. Use grep/glob/list_dir/read_file to understand the
@@ -612,6 +614,22 @@ working inside the user's project in the current working directory.
 - Be concise and direct. Briefly say why before a tool call, not after.
 - Reply in GitHub-flavored markdown. Reference code as `path:line`.
 - When you finish, give a short summary of what changed — not a play-by-play.
+
+# Memory
+- You have a `save_memory` tool for persistent cross-session memory. Use it to
+  remember user preferences, conventions, and patterns they explicitly stated or
+  demonstrated across multiple turns.
+- Memory applies to FUTURE sessions only — it does NOT alter the current
+  conversation, so the prefix cache stays valid.
+- Rules for what to save:
+  • DO save: explicit user preferences ("I prefer tabs"), tech-stack choices
+    ("we use pytest"), recurring patterns (always uses `git commit -m` not `-m`),
+    project conventions the user enforces.
+  • DO NOT save: one-off requests, temporary workarounds, the current task's
+    context, anything the user hasn't confirmed they want long-term, speculative
+    inferences about the user.
+- When in doubt, don't save. The user can always `/memory add` manually.
+- Write memories in third person: "The user prefers X over Y."
 
 Note: do not assume the current date or environment; inspect via tools when it
 matters. Volatile facts are deliberately kept out of this prompt so the cached
@@ -665,6 +683,9 @@ def _auto_approves(mode: str, name: str, reason: Optional[str]) -> bool:
     # The workspace boundary always asks, even in auto — that promise stands.
     if reason == "outside-workspace":
         return False
+    # save_memory only writes to the memory file — never destructive
+    if name == "save_memory":
+        return True
     if mode == "auto-edit":
         return name in ("edit_file", "create_file")
     if mode == "auto":
@@ -942,6 +963,7 @@ def _tool_label(fn: dict) -> str:
         "edit_file": f"edit {base('path')}",
         "create_file": f"create {base('path')}",
         "run_bash": f"run {_short(str(args.get('command', '')), 40)}",
+        "save_memory": "saving a memory",
     }.get(name, name)
 
 
@@ -1016,6 +1038,8 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
         return dim(f"  {green('create')} {bold(str(args.get('path', '?')))} {preview}{more}")
     if name == "run_bash":
         return dim(f"  {yellow('run')} {bold(str(args.get('command', '')))}")
+    if name == "save_memory":
+        return dim(f"  {magenta('memory')} {dim(str(args.get('text', ''))[:120])}")
     if name in ("read_file",):
         return dim(f"  {blue('read')} {bold(str(args.get('path', '?')))}")
     return dim(f"  {blue(name)} {dim(str(args))}")
@@ -1061,8 +1085,8 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
                     return True
                 return ans in ("y", "yes")
 
-            # in-workspace mutating tools (edit_file / create_file / run_bash)
-            if name in ("edit_file", "create_file"):
+            # in-workspace mutating tools (edit_file / create_file / run_bash / save_memory)
+            if name in ("edit_file", "create_file", "save_memory"):
                 _say(session, "meta", _confirm_preview(name, args, reason), sp)
             if _auto_approves(state.approval_mode, name, reason):
                 return True
@@ -2101,6 +2125,7 @@ def banner(state: State) -> None:
 def main() -> None:
     set_workspace_root(Path.cwd())  # the folder hrns was opened in is the sandbox root
     cfg = Config.load()
+    tools.MEMORY_PATH = cfg.memory_path  # so save_memory knows where to write
 
     # Auto-resume: load the most recent session so the terminal looks continuous.
     sessions = list_sessions(cfg.sessions_dir)
