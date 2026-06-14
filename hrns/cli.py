@@ -114,7 +114,7 @@ def _divider() -> str:
 
 
 # --- the input box (drawn inside the bottom dock) -----------------------
-#   ┌─ ⠋ 3s · $0.000042 · 12.3k · 3.4k/88 · reasoning
+#   ┌─ ⏺ 3s · $0.000042 · 12.3k · 3.4k/88 · calling api
 #   │ the user types in here
 #   └─ hrns · main · +2 -1 · chat · 95.0% · cache 4m 58s · $0.01 · $10.00 · 12.3k ctx / 48k cum · 1.2% · auto
 def _box_top(content: str) -> str:
@@ -386,6 +386,22 @@ class Spinner:
         self.cache_hit_tokens = hit
         self.cache_miss_tokens = miss
 
+    def last_head(self) -> str:
+        """The final top-border line, dimmed — shown after the turn ends."""
+        elapsed = self.elapsed
+        parts = [f"⏺ {dim(f'{elapsed:.0f}s')}"]
+        if self.prompt_cost is not None:
+            parts.append(dim(f"${self.prompt_cost:.6f}"))
+        if self.prompt_tokens is not None:
+            parts.append(dim(_human(self.prompt_tokens)))
+        if self.cache_hit_tokens is not None and self.cache_miss_tokens is not None:
+            parts.append(dim(f"{_human(self.cache_hit_tokens)}/{_human(self.cache_miss_tokens)}"))
+        parts.append(dim(self._label))
+        extra_fn = self.extra
+        if extra_fn:
+            parts.append(dim(extra_fn()))
+        return dim(" · ").join(parts)
+
     def _run(self) -> None:
         for frame in itertools.cycle(self.FRAMES):
             if self._stop.is_set():
@@ -402,6 +418,7 @@ class Spinner:
         extra = extra_fn() if extra_fn else ""
         state_fn = self.input_state
         elapsed = time.monotonic() - self._t0
+        self.elapsed = elapsed
         head = f"{cyan(self._frame)} {dim(f'{elapsed:.0f}s')}"
         if self.prompt_cost is not None:
             head += dim(" · ") + yellow(f"${self.prompt_cost:.6f}")
@@ -615,6 +632,8 @@ class State:
     # directories outside the workspace the user has approved for this session
     # (so repeat access to the same area isn't re-prompted). Not persisted.
     approved_dirs: set[Path] = field(default_factory=set)
+    # the last turn's top-border stats, shown dimmed when idle
+    last_head: str = ""
 
 
 # --- approval modes (cycled with Shift+Tab) ---------------------------
@@ -658,7 +677,7 @@ def _auto_approves(mode: str, name: str, reason: Optional[str]) -> bool:
 def session_summary(s: Session) -> str:
     rate = s.cache_hit_rate * 100
     meta = (f"{s.turn_count()} turns · {s.usage['requests']} requests · "
-            f"cache hit rate {rate:.0f}% · updated {s.updated_at}")
+            f"cache hit rate {rate:.0f}% · {_cache_age(s)} · updated {s.updated_at}")
     return (
         f"{cyan(s.id)}  {dim(s.model)}\n"
         f"   {s.title()}\n"
@@ -803,6 +822,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
 
     spinner = Spinner(state)
     typeahead.start(spinner)  # attach dock hooks first so no frame paints inline
+    state.last_head = ""             # clear the idle ghost
     spinner.start("calling api")
     start_prompt_tokens = session.usage["prompt_tokens"]  # snapshot for accumulator
     start_hit = session.usage["prompt_cache_hit_tokens"]
@@ -876,6 +896,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                     typeahead.wait_until_not_editing()
                 except KeyboardInterrupt:
                     typeahead.cancel_edit()
+        state.last_head = spinner.last_head()  # freeze for the idle prompt
         spinner.stop()    # before the hooks detach, so no frame paints inline
         typeahead.stop()
 
@@ -1672,7 +1693,7 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
 
     def redraw() -> None:
         parts: list[str] = []
-        head = ""
+        head = state.last_head
         foot = statusline(state) + dim(" · ") + mode_badge(state.approval_mode).strip()
         rows = _paint_input_box(parts, head, ed.text(), ed.cursor, block_cursor=False,
                                 foot=foot)
