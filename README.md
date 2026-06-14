@@ -88,15 +88,23 @@ runs — and you type inside it:
 ```
   …replies, diffs, and tool calls scroll here…
 
-┌─ auto · deepseek-chat · 95.0% · 3 turns · 12.3k · $0.01 · $10.00
+┌─ auto · chat · 95.0% · $0.01 · $10.00 · 12.3k ctx / 48k cum · hrns · main · +2 -1
 │ your next prompt, typed even while it works…
 └─
 ```
 
+The top border reads left to right: approval mode, model, cache-hit rate,
+session cost, account balance, context / cumulative tokens, then repo, branch,
+and git working-tree stats (`+staged -unstaged ?untracked`).
+
 Press **Enter** to queue the draft — queued prompts run in order as soon as
 the current turn finishes, and anything left half-typed pre-fills the next
-prompt. **Ctrl-C** interrupts the current turn:
-partial progress is saved, and any tool calls that never ran are answered with
+prompt. Press **↑/↓** to recall an already-queued prompt back into the field to
+edit it (Enter saves, an empty Enter cancels it); the queue won't start running
+a prompt while you're still editing one. **Shift+Enter** inserts a newline for
+multi-line prompts, and **dragging an image file** into the terminal attaches
+it to your next message. **Ctrl-C** interrupts the current turn: partial
+progress is saved, and any tool calls that never ran are answered with
 placeholders so the append-only message log stays valid.
 
 The scrollback shows what matters: your words (bold, `› `-prefixed), replies
@@ -134,14 +142,15 @@ path resolves **outside** that root — via an absolute path, `../`, or a symlin
 is blocked until you approve that specific access, *even for read-only tools*:
 
 ```
-⚠ read_file wants to read a path OUTSIDE the workspace:
-    /etc/passwd
-    workspace: /Users/you/project
-  allow access outside the workspace? [y/N]
+  ⚠ read_file wants to read OUTSIDE the workspace:
+      ~/other-project/util.py
+      workspace: ~/project
+  [y] allow once · [d] allow ~/other-project for session · [N] deny
 ```
 
-`run_bash` is unconstrained (a shell can reach anywhere), so it always asks for
-confirmation regardless.
+Choosing **d** remembers that directory for the rest of the session, so repeat
+access to the same area isn't re-prompted. `run_bash` is unconstrained (a shell
+can reach anywhere), so it always asks for confirmation regardless.
 
 ### Approval modes (Shift+Tab)
 

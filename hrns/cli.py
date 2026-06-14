@@ -7,11 +7,13 @@ left half-typed pre-fills the prompt once the turn finishes.
 
 from __future__ import annotations
 
+import base64
 import codecs
 import difflib
 import getpass
 import itertools
 import json
+import mimetypes
 import os
 import re
 import select
@@ -21,9 +23,9 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 try:  # raw key reading for Shift+Tab; absent on non-Unix terminals
     import termios
@@ -36,7 +38,13 @@ from hrns import __version__, memory
 from hrns.client import ChatResult, DeepSeekClient, DeepSeekError
 from hrns.config import Config, context_window, pricing_for
 from hrns.session import Session, list_sessions
-from hrns.tools import TOOL_SCHEMAS, execute, set_workspace_root, workspace_root
+from hrns.tools import (
+    TOOL_SCHEMAS,
+    execute,
+    resolve_target,
+    set_workspace_root,
+    workspace_root,
+)
 
 # --- ANSI styling (degrades to no-op if not a tty) --------------------
 _TTY = sys.stdout.isatty()
@@ -409,6 +417,9 @@ class State:
     session: Session
     client: Optional[DeepSeekClient]
     approval_mode: str = "confirm"
+    # directories outside the workspace the user has approved for this session
+    # (so repeat access to the same area isn't re-prompted). Not persisted.
+    approved_dirs: set[Path] = field(default_factory=set)
 
 
 # --- approval modes (cycled with Shift+Tab) ---------------------------
@@ -509,8 +520,89 @@ def _repair_dangling_tool_calls(session: Session) -> None:
             return
 
 
+# --- image attachments in the input -----------------------------------
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# tokens that may be a file path: a quoted string, or a run of non-space
+# chars where '\ ' escapes embedded spaces (how terminals paste drag-drops).
+_TOKEN_RE = re.compile(r"""'[^']*'|"[^"]*"|(?:\\.|[^\s'"])+""")
+
+
+def _unquote_token(tok: str) -> str:
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
+        return tok[1:-1]
+    return re.sub(r"\\(.)", r"\1", tok)  # un-escape '\ ', '\(' … from drag-drop
+
+
+def _extract_images(text: str) -> tuple[str, list[Path]]:
+    """Pull image-file references out of the input — drag-dropped or typed
+    paths, quoted or backslash-escaped. Returns the prompt text with those
+    tokens removed and the list of image files found. A token only counts when
+    it resolves to an existing file with an image extension, so ordinary words
+    are left untouched."""
+    images: list[Path] = []
+
+    def repl(m: "re.Match[str]") -> str:
+        p = Path(_unquote_token(m.group(0))).expanduser()
+        if p.suffix.lower() in IMAGE_EXTS and p.is_file():
+            images.append(p)
+            return ""  # drop the path from the prompt text
+        return m.group(0)
+
+    cleaned = _TOKEN_RE.sub(repl, text)
+    if not images:
+        return text, []
+    # tidy the gaps the removed tokens left, but keep author newlines intact
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = "\n".join(ln.strip() for ln in cleaned.splitlines()).strip()
+    return cleaned, images
+
+
+def _input_display(text: str) -> str:
+    """How an input line is shown/recorded: image paths replaced by compact
+    `[🖼 name]` markers so the scrollback isn't cluttered with long paths."""
+    cleaned, images = _extract_images(text)
+    if not images:
+        return text
+    marks = " ".join(cyan(f"[🖼 {p.name}]") for p in images)
+    return (cleaned + " " + marks) if cleaned else marks
+
+
+def build_user_message(text: str) -> tuple[Any, int]:
+    """Turn raw input into a chat `content` value, attaching referenced image
+    files as base64 image_url blocks (OpenAI-style multimodal). Returns
+    (content, n_images); content is a plain string when no image is attached,
+    so the common path — and the cached prefix — is unchanged."""
+    cleaned, images = _extract_images(text)
+    if not images:
+        return text, 0
+    parts: list[dict[str, Any]] = []
+    if cleaned:
+        parts.append({"type": "text", "text": cleaned})
+    attached = 0
+    for p in images:
+        try:
+            raw = p.read_bytes()
+        except OSError as e:
+            print(yellow(f"  ⚠ couldn't read image {p.name}: {e}"))
+            continue
+        if len(raw) > MAX_IMAGE_BYTES:
+            print(yellow(f"  ⚠ skipping {p.name} — exceeds the "
+                         f"{MAX_IMAGE_BYTES // 1024 // 1024}MB image limit"))
+            continue
+        mime = mimetypes.guess_type(str(p))[0] or "image/png"
+        b64 = base64.b64encode(raw).decode("ascii")
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        attached += 1
+    if attached == 0:
+        return text, 0  # nothing usable attached — fall back to the raw text
+    return parts, attached
+
+
 def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
-    state.session.append({"role": "user", "content": user_input})
+    content, _n_images = build_user_message(user_input)
+    state.session.append({"role": "user", "content": content})
     cfg, session, client = state.cfg, state.session, state.client
     assert client is not None
 
@@ -568,6 +660,18 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     except KeyboardInterrupt:
         interrupted = True
     finally:
+        # If the user is mid-edit of a queued prompt, don't tear down and run
+        # the next queued prompt underneath them — wait until they finish.
+        # An interrupted turn (or Ctrl-C while waiting) cancels the edit.
+        if typeahead.editing:
+            if interrupted:
+                typeahead.cancel_edit()
+            else:
+                spinner.set("paused — finish editing the queued prompt (Enter)")
+                try:
+                    typeahead.wait_until_not_editing()
+                except KeyboardInterrupt:
+                    typeahead.cancel_edit()
         spinner.stop()    # before the hooks detach, so no frame paints inline
         typeahead.stop()
 
@@ -635,17 +739,42 @@ def _diff_preview(old: str, new: str, limit: int = 14) -> list[str]:
     return lines
 
 
+def _tilde(p: Path) -> str:
+    """A path shown relative to $HOME (~/…) when possible, else absolute —
+    far more readable than a long absolute path in a prompt."""
+    home = Path.home()
+    if p == home:
+        return "~"
+    try:
+        return "~/" + str(p.relative_to(home))
+    except ValueError:
+        return str(p)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except ValueError:
+        return False
+
+
+def _approval_dir(target: Path) -> Path:
+    """The directory to offer remembering for an out-of-workspace target: the
+    target itself when it's a directory, otherwise the directory holding it."""
+    return target if target.is_dir() else target.parent
+
+
 def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str:
     """Describe a gated action before asking to apply it."""
     if reason == "outside-workspace":
-        path = args.get("path", ".")
+        target = resolve_target(str(args.get("path", ".")))
         verb = {
             "read_file": "read", "list_dir": "list", "glob": "search",
             "grep": "search", "edit_file": "edit", "create_file": "create",
         }.get(name, "access")
-        return (red(f"{name} wants to {verb} a path OUTSIDE the workspace:") + "\n"
-                f"    {bold(str(path))}\n"
-                + dim(f"    workspace: {workspace_root()}"))
+        return (yellow("  ⚠ ") + red(f"{name} wants to {verb} OUTSIDE the workspace:") + "\n"
+                f"      {bold(_tilde(target))}\n"
+                + dim(f"      workspace: {_tilde(workspace_root())}"))
     if name == "edit_file":
         path = str(args.get("path", "?"))
         old = args.get("old_string", "")
@@ -671,31 +800,51 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
     """Confirm gate; pauses the spinner to show a preview before applying.
 
     In an auto mode the action is shown (diff/preview) and auto-approved — except
-    out-of-workspace access, which always asks. The answer is read through the
-    type-ahead reader (it owns the keyboard while a turn runs); any half-typed
-    draft is stashed and restored around the question.
+    out-of-workspace access, which always asks unless its directory was already
+    approved this session. Out-of-workspace prompts are multi-choice: allow once,
+    allow that directory for the rest of the session, or deny. The answer is read
+    through the type-ahead reader (it owns the keyboard while a turn runs); any
+    half-typed draft is stashed and restored around the question.
     """
+    def _ask(prompt: str, docked: bool) -> str:
+        ans = typeahead.request_line(prompt).strip().lower()
+        if docked:
+            spinner.println(prompt + ans)  # echo into the flow, like replay
+        state.session.log("meta", prompt + ans)
+        return ans
+
     def confirm(name: str, args: dict, reason: Optional[str] = None) -> bool:
         session = state.session
         docked = spinner.input_line is not None
         sp = spinner if docked else None
         if not docked:
             spinner.pause()
-        if name in ("edit_file", "create_file"):
-            _say(session, "meta", _confirm_preview(name, args, reason), sp)
-        if _auto_approves(state.approval_mode, name, reason):
+        try:
+            if reason == "outside-workspace":
+                target = resolve_target(str(args.get("path", ".")))
+                # already approved this area this session → allow silently.
+                if any(_is_within(target, d) for d in state.approved_dirs):
+                    return True
+                _say(session, "meta", _confirm_preview(name, args, reason), sp)
+                adir = _approval_dir(target)
+                ans = _ask(yellow(f"  [y] allow once · [d] allow {_tilde(adir)} for "
+                                  f"session · [N] deny "), docked)
+                if ans in ("d", "a", "always"):
+                    state.approved_dirs.add(adir)
+                    _say(session, "meta",
+                         green(f"  ✓ allowing {_tilde(adir)} for the rest of this session"), sp)
+                    return True
+                return ans in ("y", "yes")
+
+            # in-workspace mutating tools (edit_file / create_file / run_bash)
+            if name in ("edit_file", "create_file"):
+                _say(session, "meta", _confirm_preview(name, args, reason), sp)
+            if _auto_approves(state.approval_mode, name, reason):
+                return True
+            return _ask(yellow("  apply? [y/N] "), docked) in ("y", "yes")
+        finally:
             if not docked:
                 spinner.resume()
-            return True
-        prompt = yellow("  allow access outside the workspace? [y/N] "
-                        if reason == "outside-workspace" else "  apply? [y/N] ")
-        ans = typeahead.request_line(prompt).strip().lower()
-        if docked:
-            spinner.println(prompt + ans)  # echo into the flow, like replay
-        session.log("meta", prompt + ans)
-        if not docked:
-            spinner.resume()
-        return ans in ("y", "yes")
     return confirm
 
 
@@ -963,43 +1112,33 @@ def _model_name(model: str) -> str:
     return _MODEL_DISPLAY.get(model, model)
 
 
-def _location_info() -> str:
-    """Short cwd + git branch and dirty status, or empty string.
-    Cached for 5s to avoid spawning git on every keystroke.
-    """
-    _cache = getattr(_location_info, "_cache", None)
-    _ts = getattr(_location_info, "_ts", 0.0)
+def _repo_info() -> tuple[str, str, int, int, int]:
+    """(repo, branch, staged, unstaged, untracked) for the status bar, so each
+    can be its own colored segment. `repo` is the git top-level's name (the
+    cwd's name when not in a repo); the rest are empty/zero outside git.
+    Cached for 5s to avoid spawning git on every keystroke."""
+    _cache = getattr(_repo_info, "_cache", None)
+    _ts = getattr(_repo_info, "_ts", 0.0)
     now = time.monotonic()
     if _cache is not None and now - _ts < 5.0:
         return _cache
-    try:
-        cwd = Path.cwd()
-        home = Path.home()
-        try:
-            cwd_short = "~" / cwd.relative_to(home)
-        except ValueError:
-            cwd_short = cwd
 
-        # git info — fast; fails silently
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+    repo, branch, staged, unstaged, untracked = "", "", 0, 0, 0
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=1,
         ).stdout.strip()
-        if not branch:
-            result = dim(str(cwd_short))
-            _location_info._cache = result
-            _location_info._ts = now
-            return result
-
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=1,
-        ).stdout
-        dirty = ""
-        if status:
-            staged = 0
-            unstaged = 0
-            untracked = 0
+        if top:
+            repo = Path(top).name
+            branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=1,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=1,
+            ).stdout
             for l in status.splitlines():
                 if len(l) < 2:
                     continue
@@ -1009,32 +1148,25 @@ def _location_info() -> str:
                     staged += 1
                 elif l[1] != " ":
                     unstaged += 1
-            parts = []
-            if staged:
-                parts.append(f"+{staged}")
-            if unstaged:
-                parts.append(f"-{unstaged}")
-            if untracked:
-                parts.append(f"?{untracked}")
-            dirty = " " + "/".join(parts) if parts else " *"
-
-        result = dim(f"{cwd_short} · {branch}{dirty}")
-        _location_info._cache = result
-        _location_info._ts = now
-        return result
+        else:
+            repo = Path.cwd().name
     except Exception:
-        result = ""
-        _location_info._cache = result
-        _location_info._ts = now
-        return result
+        repo = ""
+
+    result = (repo, branch, staged, unstaged, untracked)
+    _repo_info._cache = result
+    _repo_info._ts = now
+    return result
 
 
 def statusline(state: State) -> str:
     """One colored line of session vitals, rendered above each input prompt.
 
-    Each metric gets its own color so it's scannable at a glance:
-      cyan=model  green=cache hit rate  blue=turns  magenta=context
-      dim=cost  dim=balance
+    Order: model · cache-hit-rate · session-cost · balance · context/total
+    tokens · repo · branch · git-stats. Each metric gets its own color so it's
+    scannable at a glance:
+      cyan=model  green=cache hit rate  yellow=cost/balance  magenta=tokens
+      dim=repo  blue=branch  green/red/yellow=git +staged/-unstaged/?untracked
     """
     s = state.session
     u = s.usage
@@ -1043,17 +1175,27 @@ def statusline(state: State) -> str:
     cost = s.cost(pricing_for(s.model))
     bal = state.cfg.balance
     cum_tok = u["prompt_tokens"] + u["completion_tokens"]
+    repo, branch, staged, unstaged, untracked = _repo_info()
+
+    gparts = []
+    if staged:
+        gparts.append(green(f"+{staged}"))
+    if unstaged:
+        gparts.append(red(f"-{unstaged}"))
+    if untracked:
+        gparts.append(yellow(f"?{untracked}"))
 
     segs = [
-        _location_info(),
-        cyan(_model_name(s.model)),
-        green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),
-        blue(f"{s.turn_count()} turn{'' if s.turn_count() == 1 else 's'}"),
-        magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),
-        yellow(_money(cost)),
-        yellow(f"${bal:.2f}" if bal is not None else "--"),
+        cyan(_model_name(s.model)),                                          # model
+        green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),    # cache hit rate
+        yellow(_money(cost)),                                                # session cost
+        yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
+        magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
+        dim(repo),                                                           # repo
+        blue(branch),                                                        # branch
+        " ".join(gparts),                                                    # git stats
     ]
-    return dim(" · ").join(s for s in segs if s)
+    return dim(" · ").join(seg for seg in segs if seg)
 
 
 # --- input: line editing, type-ahead, and the prompt queue ------------
@@ -1112,8 +1254,10 @@ class LineEditor:
     interactive prompt and the during-turn type-ahead.
 
     Keys: left/right/home/end, ctrl/alt+arrows word-jump, backspace/delete,
-    ctrl+W del-word, ctrl+U/K kill to start/end, ctrl+A/E home/end,
-    ctrl+L clear screen, shift+tab cycle approval mode.
+    ctrl+W & ctrl/shift+backspace del-word, ctrl+U/K kill to start/end,
+    ctrl+A/E home/end, ctrl+L clear screen, shift+tab cycle approval mode,
+    shift/alt+enter insert newline (plain enter submits), up/down recall
+    queued prompts.
     """
 
     def __init__(self, text: str = "") -> None:
@@ -1126,6 +1270,17 @@ class LineEditor:
     def set_text(self, text: str) -> None:
         self.buf = list(text)
         self.cursor = len(self.buf)
+
+    def cursor_line(self) -> "tuple[int, int, list[str]]":
+        """(line index, column within that line, all lines) for the cursor —
+        lets a one-row field show and edit the line the cursor sits on."""
+        lines = self.text().split("\n")
+        pos = self.cursor
+        for i, ln in enumerate(lines):
+            if pos <= len(ln):
+                return i, pos, lines
+            pos -= len(ln) + 1
+        return len(lines) - 1, len(lines[-1]), lines
 
     @staticmethod
     def _is_word(ch: str) -> bool:
@@ -1143,14 +1298,33 @@ class LineEditor:
         while self.cursor < len(self.buf) and self._is_word(self.buf[self.cursor]):
             self.cursor += 1
 
+    def _insert(self, s: str) -> None:
+        for ch in s:
+            self.buf.insert(self.cursor, ch)
+            self.cursor += 1
+
+    def _backspace(self) -> None:
+        if self.cursor > 0:
+            self.cursor -= 1
+            del self.buf[self.cursor]
+
+    def _delete_word_left(self) -> None:
+        end = self.cursor
+        self._word_left()
+        del self.buf[self.cursor:end]
+
     def handle(self, ch: str, getch: Callable[[], str]) -> str:
         """Apply one keypress. Returns: submit / interrupt / eof /
-        clear-screen / shift-tab / tab / edit."""
+        clear-screen / shift-tab / tab / up / down / edit.
+
+        Plain Enter (\\r) submits; Shift/Alt+Enter and pasted newlines insert a
+        literal newline (multi-line prompts). Backspace deletes a char; Ctrl+W
+        and Ctrl/Shift+Backspace (where the terminal encodes the modifier, plus
+        Ctrl-H) delete the previous word."""
         if ch == "\r":                                # Enter — submit
             return "submit"
-        if ch == "\n":                                # literal newline from paste
-            self.buf.insert(self.cursor, "\n")
-            self.cursor += 1
+        if ch == "\n":                                # newline (paste / Ctrl+J) — insert
+            self._insert("\n")
             return "edit"
         if ch == "\x03":
             return "interrupt"
@@ -1164,79 +1338,112 @@ class LineEditor:
             self.cursor = 0
         elif ch == "\x05":                            # Ctrl+E — end
             self.cursor = len(self.buf)
-        elif ch in ("\x08", "\x7f"):                  # backspace
-            if self.cursor > 0:
-                self.cursor -= 1
-                del self.buf[self.cursor]
+        elif ch == "\x7f":                            # Backspace — delete char
+            self._backspace()
+        elif ch == "\x08":                            # Ctrl-H / Ctrl+Backspace — delete word
+            self._delete_word_left()
         elif ch == "\x0b":                            # Ctrl+K — kill to end
             del self.buf[self.cursor:]
         elif ch == "\x15":                            # Ctrl+U — kill to start
             del self.buf[:self.cursor]
             self.cursor = 0
         elif ch == "\x17":                            # Ctrl+W — delete word back
-            end = self.cursor
-            self._word_left()
-            del self.buf[self.cursor:end]
+            self._delete_word_left()
         elif ch == "\x1b":
             return self._escape(getch)
         elif ch.isprintable():
-            self.buf.insert(self.cursor, ch)
-            self.cursor += 1
+            self._insert(ch)
         return "edit"
 
     def _escape(self, getch: Callable[[], str]) -> str:
         nxt = getch()
-        if nxt == "\r":                               # Alt+Enter — insert newline
-            self.buf.insert(self.cursor, "\n")
-            self.cursor += 1
-        elif nxt == "[":
-            code = getch()
-            if code == "Z":                           # Shift+Tab
-                return "shift-tab"
-            if code == "C" and self.cursor < len(self.buf):   # right
-                self.cursor += 1
-            elif code == "D" and self.cursor > 0:             # left
-                self.cursor -= 1
-            elif code == "H":                         # Home
-                self.cursor = 0
-            elif code == "F":                         # End
-                self.cursor = len(self.buf)
-            elif code == "1":                         # ^[[1~ Home / ^[[1;5x Ctrl+arrow
-                nxt2 = getch()
-                if nxt2 == "~":
-                    self.cursor = 0
-                elif nxt2 == ";":
-                    mod = getch()
-                    dr = getch()                      # final byte of the sequence
-                    if mod == "5":
-                        if dr == "D":
-                            self._word_left()
-                        elif dr == "C":
-                            self._word_right()
-            elif code == "4":                         # ^[[4~ End
-                if getch() == "~":
-                    self.cursor = len(self.buf)
-            elif code == "3":                         # ^[[3~ Delete
-                if getch() == "~" and self.cursor < len(self.buf):
-                    del self.buf[self.cursor]
-            elif code and code in "0256789":          # any other CSI — consume
-                while True:
-                    c = getch()
-                    if c in ("~", "") or c.isalpha():
-                        break
+        if nxt == "":                                 # bare ESC — ignore
             return "edit"
-        if nxt == "b":                                # Alt+b / Alt+left — word left
-            self._word_left()
-        elif nxt == "f":                              # Alt+f / Alt+right — word right
-            self._word_right()
+        if nxt in ("\r", "\n"):                       # Alt/Shift+Enter (ESC+CR) — newline
+            self._insert("\n")
+        elif nxt in ("\x7f", "\x08"):                 # Alt+Backspace — delete word
+            self._delete_word_left()
+        elif nxt == "[":
+            return self._csi(getch)
         elif nxt == "O":                              # SS3: ^[OH Home, ^[OF End
             code = getch()
             if code == "H":
                 self.cursor = 0
             elif code == "F":
                 self.cursor = len(self.buf)
-        # other Alt+key sequences (or a bare ESC): ignore
+        elif nxt == "b":                              # Alt+b / Alt+left — word left
+            self._word_left()
+        elif nxt == "f":                              # Alt+f / Alt+right — word right
+            self._word_right()
+        # other Alt+key sequences: ignore
         return "edit"
+
+    def _csi(self, getch: Callable[[], str]) -> str:
+        """Parse a CSI sequence (the bytes after ESC '['): collect the numeric
+        parameters, read the final byte, then dispatch. Fully consuming the
+        sequence keeps unknown ones from leaking as typed characters, and the
+        parameters carry the modifier — so Shift+Enter (newline) and
+        Shift/Ctrl+Backspace (delete word) work in terminals that encode them
+        via modifyOtherKeys (CSI 27;m;k ~) or CSI-u (CSI cp;m u)."""
+        params, final = "", ""
+        while True:
+            c = getch()
+            if c == "":                               # truncated — give up cleanly
+                return "edit"
+            if c.isdigit() or c in ";:":
+                params += c
+                continue
+            final = c
+            break
+        nums = [int(p) for p in params.split(";") if p.isdigit()]
+        mods = nums[1] if len(nums) > 1 else 1        # 1 = no modifier
+
+        if final == "Z":                              # Shift+Tab
+            return "shift-tab"
+        if final in ("A", "B"):                       # Up / Down
+            return "up" if final == "A" else "down"
+        if final == "u":                              # CSI-u: codepoint ; mods u
+            key = nums[0] if nums else 0
+            if key == 13:                             # Enter
+                if mods > 1:
+                    self._insert("\n")
+                    return "edit"
+                return "submit"
+            if key in (127, 8):                       # Backspace
+                self._delete_word_left() if mods > 1 else self._backspace()
+            return "edit"
+        if final == "~":                              # CSI n [; mods] ~
+            n = nums[0] if nums else 0
+            if n in (1, 7):
+                self.cursor = 0                       # Home
+            elif n in (4, 8):
+                self.cursor = len(self.buf)           # End
+            elif n == 3 and self.cursor < len(self.buf):
+                del self.buf[self.cursor]             # Delete
+            elif n == 27 and len(nums) >= 3:          # modifyOtherKeys: 27 ; mods ; key ~
+                key = nums[2]
+                if key == 13:                         # Enter
+                    if mods > 1:
+                        self._insert("\n")
+                    else:
+                        return "submit"
+                elif key in (127, 8):                 # Backspace
+                    self._delete_word_left()
+            return "edit"
+        # cursor / nav letters, optionally modified (CSI [1 ; mods] <letter>)
+        word = mods in (3, 4, 5, 6, 7, 8)             # Alt/Ctrl combos → move by word
+        if final == "C":                              # right
+            self._word_right() if word else self._move(+1)
+        elif final == "D":                            # left
+            self._word_left() if word else self._move(-1)
+        elif final == "H":
+            self.cursor = 0
+        elif final == "F":
+            self.cursor = len(self.buf)
+        return "edit"
+
+    def _move(self, delta: int) -> None:
+        self.cursor = max(0, min(len(self.buf), self.cursor + delta))
 
 
 def read_line(prompt_fn, state: State, initial: str = "") -> str:
@@ -1277,11 +1484,13 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
             # the input row is drawn last so the cursor parks inside the box
             text_display = ed.text()
             if "\n" in text_display:
-                first = text_display.split("\n")[0]
-                nl = text_display.count("\n")
-                text_display = first + dim(f" +{nl} more line{'s' if nl > 1 else ''}")
+                # one row, many lines: show the line the cursor is on with a
+                # [n/total] tag, and park the cursor at its column within it.
+                li, col, lines = ed.cursor_line()
+                cur = lines[li]
+                text_display = dim(f"[{li + 1}/{len(lines)}] ") + cur
                 ghost = ""                # display text no longer maps to buf
-                cursor_offset = 0
+                cursor_offset = len(cur) - col
             else:
                 cursor_offset = len(ed.buf) - ed.cursor + len(ghost)
             parts.append(f"\033[{inp_row};1H\033[K" + _box_mid(text_display + dim(ghost)))
@@ -1312,12 +1521,15 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
             act = ed.handle(ch, lambda: keys.getch(0.05))
             if act == "submit":
                 text = ed.text()
-                # clear the input row, then echo the line into the flow (bold)
+                # clear the input row, then echo the line into the flow (bold).
+                # image paths show as compact markers, but the raw text is what
+                # we return (and what the turn turns into image attachments).
+                shown = bold(_input_display(text))
                 if _Dock.active:
                     sys.stdout.write(f"\033[{_Dock.rows - 1};1H\033[K" + _box_mid("")
-                                     + "\0338\r\n" + prompt_fn() + bold(text) + "\r\n")
+                                     + "\0338\r\n" + prompt_fn() + shown + "\r\n")
                 else:
-                    sys.stdout.write("\r\033[K" + prompt_fn() + bold(text) + "\r\n")
+                    sys.stdout.write("\r\033[K" + prompt_fn() + shown + "\r\n")
                 sys.stdout.flush()
                 return text
             if act == "interrupt":
@@ -1356,6 +1568,12 @@ class TypeAhead:
     soon as the current turn finishes. Unsubmitted text survives the turn and
     pre-fills the next interactive prompt.
 
+    Up/Down recall already-queued prompts back into the editor for editing or
+    cancellation (Enter saves, an empty Enter drops that one). While such an
+    edit is in progress the queue is "paused": wait_until_not_editing() blocks
+    the turn from consuming the next prompt until the user finishes, so a
+    half-edited message never starts running underneath them.
+
     A confirm prompt can borrow the keyboard via request_line(); the
     half-typed draft is stashed and restored around it.
 
@@ -1376,10 +1594,39 @@ class TypeAhead:
         self._req_prompt: Optional[str] = None
         self._req_text = ""
         self._req_done = threading.Event()
+        # queue-editing state: which queued slot is being edited (None = the
+        # live draft), the live draft stashed while editing, and a gate that's
+        # SET whenever no edit is in progress (so consumption can proceed).
+        self._edit_idx: Optional[int] = None
+        self._live_stash = ""
+        self._edit_hinted = False
+        self._not_editing = threading.Event()
+        self._not_editing.set()
 
     @property
     def active(self) -> bool:
         return self._thread is not None
+
+    @property
+    def editing(self) -> bool:
+        """True while the user is editing an already-queued prompt."""
+        return self._edit_idx is not None
+
+    def wait_until_not_editing(self) -> None:
+        """Block until no queued-message edit is in progress. Used to defer
+        queue consumption — a turn must not start running the next queued
+        prompt while the user is still editing one."""
+        self._not_editing.wait()
+
+    def cancel_edit(self) -> None:
+        """Abandon any in-progress queue edit, restoring the live draft."""
+        with self._lock:
+            if self._edit_idx is not None:
+                self._editor.set_text(self._live_stash)
+                self._live_stash = ""
+                self._edit_idx = None
+                self._edit_hinted = False
+        self._not_editing.set()
 
     def start(self, spinner: Spinner) -> None:
         if not _raw_capable() or self.active:
@@ -1451,10 +1698,13 @@ class TypeAhead:
 
     # --- what the docked rows show ---------------------------------------
     def _badge(self) -> str:
-        """Queued-prompt count, appended to the status row."""
+        """Queued-prompt count (or the edit position), on the status row."""
         with self._lock:
             queued = len(self.queue)
-        return "  " + yellow(f"[{queued} queued]") if queued else ""
+            editing = self._edit_idx
+        if editing is not None:
+            return "  " + yellow(f"[editing {editing + 1}/{queued}]")
+        return ("  " + yellow(f"[{queued} queued]")) if queued else ""
 
     def _input_row(self) -> str:
         """The input box's middle-row content: the draft (or a confirm
@@ -1495,23 +1745,26 @@ class TypeAhead:
     # --- reader thread ----------------------------------------------------
     def _run(self) -> None:
         keys = _keys()
-        while not self._stop.is_set():
-            if not keys.ready(0.05):
-                continue
-            ch = keys.getch()
-            if ch == "":                              # stdin closed
-                return
-            self._on_key(ch, lambda: keys.getch(0.05))
+        try:
+            while not self._stop.is_set():
+                if not keys.ready(0.05):
+                    continue
+                ch = keys.getch()
+                if ch == "":                          # stdin closed
+                    return
+                self._on_key(ch, lambda: keys.getch(0.05))
+        finally:
+            self._not_editing.set()                   # never strand a waiter
 
     def _on_key(self, ch: str, getch: Callable[[], str]) -> None:
         with self._lock:
             in_request = self._req_prompt is not None
             act = self._editor.handle(ch, getch)
-            text = self._editor.text().strip() if act == "submit" else ""
+            submit_text = self._editor.text().strip() if act == "submit" else ""
 
         if in_request:
             if act == "submit":
-                self._req_text = text
+                self._req_text = submit_text
                 self._req_done.set()
             elif act in ("interrupt", "eof"):
                 self._req_done.set()                  # empty answer = decline
@@ -1519,26 +1772,95 @@ class TypeAhead:
                 self._spinner.render_now()
             return
 
+        # `note` is any one-time line to print into the flow; computed while
+        # holding the lock but printed after releasing it (printing re-enters
+        # the spinner's io lock, so we must not hold ours — see the deadlock
+        # fixed in 5be1f5f).
+        note: Optional[str] = None
         if act == "submit":
-            with self._lock:
-                if text:
-                    self.queue.append(text)
-                self._editor.set_text("")
-            if text and self._spinner:
-                self._spinner.println(dim("  + queued: ") + text)
+            note = self._commit_submit(submit_text)
+        elif act == "up":
+            note = self._nav_queue(-1)
+        elif act == "down":
+            note = self._nav_queue(+1)
         elif act == "shift-tab":
             _cycle_mode(self.state)
-            if self._spinner:
-                self._spinner.println(
-                    dim("  approval mode → ") + mode_badge(self.state.approval_mode).strip())
+            note = dim("  approval mode → ") + mode_badge(self.state.approval_mode).strip()
         elif act == "tab":
             with self._lock:
                 matches = _complete_command(self._editor)
-            if matches and self._spinner:             # ambiguous — list candidates
-                self._spinner.println(dim("  " + "  ".join(matches)))
+            if matches:                               # ambiguous — list candidates
+                note = dim("  " + "  ".join(matches))
         # eof / interrupt / clear-screen make no sense mid-turn — ignored
+
+        if note and self._spinner:
+            self._spinner.println(note)
         if self._spinner:
             self._spinner.render_now()
+
+    # --- queue editing (driven from _on_key, runs in the reader thread) ---
+    def _commit_submit(self, text: str) -> Optional[str]:
+        """Enter pressed. While editing a queued slot this saves the edit back
+        (empty text drops that slot); otherwise it queues `text` as a new
+        prompt."""
+        with self._lock:
+            if self._edit_idx is not None:
+                return self._finish_edit_locked(text)
+            if text:
+                self.queue.append(text)
+            self._editor.set_text("")
+            return (dim("  + queued: ") + text) if text else None
+
+    def _nav_queue(self, direction: int) -> Optional[str]:
+        """Up (-1) / Down (+1) through queued prompts for editing. Up from the
+        live draft enters edit mode at the newest queued prompt; Down past the
+        newest leaves edit mode and restores the live draft. Edits to the
+        current slot are persisted as you navigate."""
+        with self._lock:
+            if self._edit_idx is None:
+                if direction > 0 or not self.queue:
+                    return None                       # nothing to recall
+                self._live_stash = self._editor.text()
+                self._edit_idx = len(self.queue) - 1
+                self._editor.set_text(self.queue[self._edit_idx])
+                self._not_editing.clear()
+                first, self._edit_hinted = not self._edit_hinted, True
+                return (dim("  editing queued — ↑/↓ navigate · Enter saves · "
+                            "empty Enter cancels") if first else None)
+            # already editing: stash the current text into its slot, then move
+            self.queue[self._edit_idx] = self._editor.text().strip()
+            new_idx = self._edit_idx + direction
+            if new_idx >= len(self.queue):            # past the newest → live draft
+                self._exit_edit_locked()
+                return None
+            self._edit_idx = max(0, new_idx)
+            self._editor.set_text(self.queue[self._edit_idx])
+            return None
+
+    def _finish_edit_locked(self, text: str) -> Optional[str]:
+        """Save (or, when empty, drop) the slot being edited, then leave edit
+        mode. Caller holds the lock."""
+        idx = self._edit_idx
+        note = None
+        if idx is not None and 0 <= idx < len(self.queue):
+            if text:
+                self.queue[idx] = text
+                note = dim("  ~ updated queued prompt")
+            else:
+                del self.queue[idx]
+                note = dim("  ✗ cancelled a queued prompt")
+        self._exit_edit_locked()
+        return note
+
+    def _exit_edit_locked(self) -> None:
+        """Leave edit mode: prune any emptied slots, restore the live draft,
+        and release the consumption gate. Caller holds the lock."""
+        self.queue = deque(m for m in self.queue if m.strip())
+        self._editor.set_text(self._live_stash)
+        self._live_stash = ""
+        self._edit_idx = None
+        self._edit_hinted = False
+        self._not_editing.set()
 
 
 # --- replay previous sessions on resume --------------------------------
@@ -1576,7 +1898,8 @@ def banner(state: State) -> None:
     cyc = "shift+tab" if _raw_capable() else "/mode"
     print(dim(f"  approval {state.approval_mode} ({cyc} to cycle) · /help · Ctrl-D to exit"))
     if _raw_capable():
-        print(dim("  type while it works — Enter queues your next prompt · Ctrl-C interrupts"))
+        print(dim("  type while it works — Enter queues your next prompt · ↑ edits a queued one · Ctrl-C interrupts"))
+        print(dim("  Shift+Enter for a newline · drag an image in to attach it"))
 
 
 def main() -> None:
@@ -1629,7 +1952,7 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
         if from_queue:
             # a prompt queued while the previous turn ran — echo it like input
             line = typeahead.queue.popleft().strip()
-            print(("\n" if docked else "") + prompt_fn() + bold(line) + dim("  (queued)"))
+            print(("\n" if docked else "") + prompt_fn() + bold(_input_display(line)) + dim("  (queued)"))
         else:
             try:
                 line = read_line(prompt_fn, state, initial=typeahead.take_text()).strip()
@@ -1658,7 +1981,7 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
             print(yellow("Not connected. Run /connect to set your DeepSeek API key."))
             continue
 
-        echo = prompt_fn() + bold(line) + (dim("  (queued)") if from_queue else "")
+        echo = prompt_fn() + bold(_input_display(line)) + (dim("  (queued)") if from_queue else "")
         state.session.log("user", "\n" + echo)
         try:
             run_turn(state, line, typeahead)

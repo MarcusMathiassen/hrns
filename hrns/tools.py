@@ -88,6 +88,16 @@ def _escape_path(name: str, args: dict) -> str | None:
     return str(raw) if _is_outside(raw) else None
 
 
+def resolve_target(path_str: str) -> Path:
+    """The absolute, symlink-resolved path a tool's `path` argument refers to,
+    anchored to the workspace root for relative paths — the same resolution the
+    containment check uses. Lets the CLI show and remember real targets."""
+    p = Path(str(path_str)).expanduser()
+    if not p.is_absolute():
+        p = WORKSPACE_ROOT / p
+    return Path(os.path.realpath(str(p)))
+
+
 # --- schemas advertised to the model ----------------------------------
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
