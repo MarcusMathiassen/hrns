@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -81,6 +82,27 @@ def _money(c: float) -> str:
     return f"${c:.6f}"
 
 
+def _cache_age(session: Session) -> str:
+    """Colored time since the last request (cache refresh). DeepSeek's KV cache
+    TTL is ~5 minutes; each request resets the clock.
+
+    green < 2 min, yellow < 4 min, red >= 4 min."""
+    try:
+        updated = datetime.fromisoformat(session.updated_at)
+    except (ValueError, TypeError):
+        return dim("cache --")
+    age = (datetime.now(timezone.utc) - updated).total_seconds()
+    if age < 0:
+        return dim("cache --")
+    m, s = divmod(int(age), 60)
+    label = f"cache {m}m {s}s" if m else f"cache {s}s"
+    if age < 120:
+        return green(label)
+    if age < 240:
+        return yellow(label)
+    return red(label)
+
+
 def _divider() -> str:
     """A dim rule spanning the full terminal width (re-measured per call,
     so it tracks live resizes)."""
@@ -90,7 +112,7 @@ def _divider() -> str:
 # --- the input box (drawn inside the bottom dock) -----------------------
 #   ┌─ ⠋ 3s · $0.000042 · 12.3k · reasoning
 #   │ the user types in here
-#   └─ hrns · main · +2 -1 · chat · 95.0% · $0.01 · $10.00 · 12.3k ctx / 48k cum · … · auto
+#   └─ hrns · main · +2 -1 · chat · 95.0% · cache 2m 14s · $0.01 · $10.00 · 12.3k ctx / 48k cum · 1.2% · auto
 def _box_top(content: str) -> str:
     return dim("┌─ ") + content
 
@@ -1358,6 +1380,7 @@ def statusline(state: State) -> str:
         " ".join(gparts),                                                    # git stats
         cyan(_model_name(s.model)),                                          # model
         green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),    # cache hit rate
+        _cache_age(s),                                                       # cache freshness
         yellow(_money(cost)),                                                # session cost
         yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
         magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
