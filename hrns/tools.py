@@ -510,4 +510,9 @@ def execute(name: str, raw_args: str, confirm: Callable[..., bool]) -> str:
             return (f"User declined: {name} would access '{escape}', which is outside "
                     f"the workspace ({WORKSPACE_ROOT}). Stay within the project directory.")
         return f"User declined to run {name}."
-    return fn(args)
+    try:
+        return fn(args)
+    except KeyError as e:
+        return f"ERROR: {name} is missing required argument {e}."
+    except Exception as e:  # noqa: BLE001 — a bad tool call must not crash the loop
+        return f"ERROR: {name} failed: {e}"

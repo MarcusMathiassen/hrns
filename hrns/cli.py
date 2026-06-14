@@ -82,23 +82,27 @@ def _money(c: float) -> str:
     return f"${c:.6f}"
 
 
-def _cache_age(session: Session) -> str:
-    """Colored time since the last request (cache refresh). DeepSeek's KV cache
-    TTL is ~5 minutes; each request resets the clock.
+_CACHE_TTL = 300  # DeepSeek KV cache TTL in seconds
 
-    green < 2 min, yellow < 4 min, red >= 4 min."""
+
+def _cache_age(session: Session) -> str:
+    """Colored countdown until the KV cache expires. Each API request resets
+    the clock; DeepSeek's TTL is ~5 minutes.
+
+    green > 3 min, yellow > 1 min, red ≤ 1 min."""
     try:
         updated = datetime.fromisoformat(session.updated_at)
     except (ValueError, TypeError):
         return dim("cache --")
     age = (datetime.now(timezone.utc) - updated).total_seconds()
-    if age < 0:
-        return dim("cache --")
-    m, s = divmod(int(age), 60)
+    remaining = max(0, _CACHE_TTL - age)
+    if age < 0 or remaining <= 0:
+        return red("cache expired")
+    m, s = divmod(int(remaining), 60)
     label = f"cache {m}m {s}s" if m else f"cache {s}s"
-    if age < 120:
+    if remaining > 180:
         return green(label)
-    if age < 240:
+    if remaining > 60:
         return yellow(label)
     return red(label)
 
@@ -110,9 +114,9 @@ def _divider() -> str:
 
 
 # --- the input box (drawn inside the bottom dock) -----------------------
-#   ┌─ ⠋ 3s · $0.000042 · 12.3k · reasoning
+#   ┌─ ⠋ 3s · $0.000042 · 12.3k · 3.4k/88 · reasoning
 #   │ the user types in here
-#   └─ hrns · main · +2 -1 · chat · 95.0% · cache 2m 14s · $0.01 · $10.00 · 12.3k ctx / 48k cum · 1.2% · auto
+#   └─ hrns · main · +2 -1 · chat · 95.0% · cache 4m 58s · $0.01 · $10.00 · 12.3k ctx / 48k cum · 1.2% · auto
 def _box_top(content: str) -> str:
     return dim("┌─ ") + content
 
@@ -354,6 +358,9 @@ class Spinner:
         self.prompt_tokens: Optional[int] = None
         # prompt cost accumulated during this turn (set from run_turn)
         self.prompt_cost: Optional[float] = None
+        # per-request cache hit / miss tokens (set from run_turn)
+        self.cache_hit_tokens: Optional[int] = None
+        self.cache_miss_tokens: Optional[int] = None
 
     def start(self, label: str = "working") -> None:
         self._label = label
@@ -374,6 +381,10 @@ class Spinner:
 
     def set_prompt_cost(self, c: float) -> None:
         self.prompt_cost = c
+
+    def set_cache_stats(self, hit: int, miss: int) -> None:
+        self.cache_hit_tokens = hit
+        self.cache_miss_tokens = miss
 
     def _run(self) -> None:
         for frame in itertools.cycle(self.FRAMES):
@@ -396,6 +407,9 @@ class Spinner:
             head += dim(" · ") + yellow(f"${self.prompt_cost:.6f}")
         if self.prompt_tokens is not None:
             head += dim(" · ") + magenta(_human(self.prompt_tokens))
+        if self.cache_hit_tokens is not None and self.cache_miss_tokens is not None:
+            head += dim(" · ") + green(_human(self.cache_hit_tokens)) \
+                + dim("/") + red(_human(self.cache_miss_tokens))
         head += dim(" · ") + label
         if extra:
             head += " " + extra
@@ -831,6 +845,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             dh = session.usage["prompt_cache_hit_tokens"] - start_hit
             dm = session.usage["prompt_cache_miss_tokens"] - start_miss
             spinner.set_prompt_cost(dh / 1e6 * p["cache_hit"] + dm / 1e6 * p["cache_miss"])
+            spinner.set_cache_stats(dh, dm)
 
             tool_calls = result.message.get("tool_calls")
             if not tool_calls:
@@ -1681,6 +1696,9 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
         tty.setraw(fd)
         redraw()                          # establishes/normalizes the dock
         while True:
+            if not keys.ready(1.0):       # 1s tick — keeps the cache-age alive
+                redraw()
+                continue
             ch = keys.getch()
             if ch == "":                             # stdin closed — never recovers
                 to_flow()
