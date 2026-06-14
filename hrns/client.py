@@ -78,6 +78,8 @@ class DeepSeekClient:
         messages: list[dict[str, Any]],
         tools: Optional[list[dict]] = None,
         temperature: float = 0.3,
+        thinking: dict[str, str] | None = None,
+        reasoning_effort: str = "high",
         on_text: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
     ) -> ChatResult:
@@ -88,8 +90,12 @@ class DeepSeekClient:
             "prefix": True,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "temperature": temperature,
         }
+        if thinking is not None:
+            payload["thinking"] = thinking
+            payload["reasoning_effort"] = reasoning_effort
+        else:
+            payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
 
@@ -101,6 +107,7 @@ class DeepSeekClient:
         )
 
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, str]] = {}
         usage: dict[str, Any] = {}
         finish_reason: Optional[str] = None
@@ -108,7 +115,23 @@ class DeepSeekClient:
         try:
             resp = urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
-            raise DeepSeekError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}") from e
+            body = e.read().decode("utf-8", "replace")[:500]
+            code = e.code
+            if code == 401:
+                hint = "Bad API key — run /connect to set your key"
+            elif code == 402:
+                hint = "Insufficient balance — top up at https://platform.deepseek.com"
+            elif code == 429:
+                hint = "Rate limited — slow down and retry"
+            elif code == 400:
+                hint = f"Invalid request: {body}"
+            elif code == 422:
+                hint = f"Invalid parameters: {body}"
+            elif code in (500, 503):
+                hint = "DeepSeek server error — retry in a moment"
+            else:
+                hint = body
+            raise DeepSeekError(f"HTTP {code}: {hint}") from e
         except urllib.error.URLError as e:
             raise DeepSeekError(f"Could not reach {self.base_url}: {e.reason}") from e
 
@@ -136,10 +159,13 @@ class DeepSeekClient:
                 if choice.get("finish_reason"):
                     finish_reason = choice["finish_reason"]
 
-                # reasoning_content shows up on deepseek-reasoner
+                # reasoning_content — accumulate for multi-turn context so
+                # tool-call turns can pass it back (required by the API).
                 reasoning = delta.get("reasoning_content")
-                if reasoning and on_reasoning:
-                    on_reasoning(reasoning)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    if on_reasoning:
+                        on_reasoning(reasoning)
 
                 text = delta.get("content")
                 if text:
@@ -160,6 +186,8 @@ class DeepSeekClient:
 
         message: dict[str, Any] = {"role": "assistant"}
         message["content"] = "".join(content_parts) or None
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls:
             message["tool_calls"] = [
                 {

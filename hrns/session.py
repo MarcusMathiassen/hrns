@@ -83,7 +83,7 @@ class Session:
     def from_dict(cls, data: dict[str, Any]) -> "Session":
         s = cls(
             id=data["id"],
-            model=data.get("model", "deepseek-chat"),
+            model=data.get("model", "deepseek-v4-pro"),
             created_at=data.get("created_at", _now()),
             updated_at=data.get("updated_at", _now()),
             messages=data.get("messages", []),

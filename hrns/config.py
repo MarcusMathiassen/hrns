@@ -15,9 +15,9 @@ from pathlib import Path
 from hrns import storage
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-# deepseek-chat is the broadly-available alias (non-thinking deepseek-v4-flash).
-# Swap to deepseek-reasoner for thinking mode, or deepseek-v4-pro for the larger model.
-DEFAULT_MODEL = "deepseek-chat"
+# Thinking is a request toggle, not a model-name switch. deepseek-v4-pro is
+# the default — it has the strongest reasoning and a 500 concurrency headroom.
+DEFAULT_MODEL = "deepseek-v4-pro"
 
 # Per-1M-token pricing in USD. Source: https://api-docs.deepseek.com/quick_start/pricing
 # The whole point of this harness is to push tokens into the cheap "cache hit" column.

@@ -71,7 +71,7 @@ second ⇥ lists the candidates.
 |---|---|
 | `/connect` | Configure & test the DeepSeek connection (key, base URL, model) — **remembered for next run** |
 | `/sessions` | List saved sessions; `/sessions <id\|#>` resumes one (re-hits the cache) |
-| `/clear` | Archive the current session and start a fresh one |
+| `/new` | Archive the current session and start a fresh one |
 | `/memory` | `add <text>` / `rm <id>` / `clear` — durable facts baked into new sessions |
 | `/model` | Show or set the model for new sessions — **remembered for next run** |
 | `/mode` | Cycle approval mode: confirm → auto-edit → auto (or **Shift+Tab**) |

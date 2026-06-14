@@ -57,6 +57,7 @@ def _c(code: str, text: str) -> str:
 
 
 def dim(t: str) -> str: return _c("2", t)
+def gray(t: str) -> str: return _c("38;5;242", t)
 def bold(t: str) -> str: return _c("1", t)
 def cyan(t: str) -> str: return _c("36", t)
 def green(t: str) -> str: return _c("32", t)
@@ -718,11 +719,11 @@ def _api_stats(model: str, usage: dict, elapsed: float) -> str:
 
 
 def render_assistant(md: str) -> str:
-    """Render a reply with a speaker marker so it's clear who said what:
-    the first line gets a cyan bullet, the rest is indented under it."""
+    """Render a reply indented under a cyan bullet — visually subordinate
+    to the magenta ▸ user prompt, creating a clear prompt/response divide."""
     body = format_markdown(md) if md else dim("(no text response)")
     lines = body.split("\n")
-    return "\n".join([cyan("∙ ") + lines[0]] + ["  " + ln for ln in lines[1:]])
+    return "\n".join([cyan("  ∙ ") + lines[0]] + ["    " + ln for ln in lines[1:]])
 
 
 def _say(session: Session, kind: str, text: str, spinner: Optional[Spinner] = None) -> None:
@@ -795,12 +796,13 @@ def _extract_images(text: str) -> tuple[str, list[Path]]:
 
 def _input_display(text: str) -> str:
     """How an input line is shown/recorded: image paths replaced by compact
-    `[🖼 name]` markers so the scrollback isn't cluttered with long paths."""
+    `[🖼 name]` markers so the scrollback isn't cluttered with long paths.
+    Multi-line pastes are bolded per-line so ANSI codes don't bleed."""
     cleaned, images = _extract_images(text)
-    if not images:
-        return text
-    marks = " ".join(cyan(f"[🖼 {p.name}]") for p in images)
-    return (cleaned + " " + marks) if cleaned else marks
+    if images:
+        marks = " ".join(cyan(f"[🖼 {p.name}]") for p in images)
+        text = (cleaned + " " + marks) if cleaned else marks
+    return "\n".join(bold(ln) for ln in text.split("\n"))
 
 
 def build_user_message(text: str) -> tuple[Any, int]:
@@ -850,6 +852,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     start_miss = session.usage["prompt_cache_miss_tokens"]
     p = pricing_for(session.model)
     final_text = ""
+    reasoning_line_buf = ""       # partial line accumulator for streamed reasoning
     error: Optional[str] = None
     interrupted = False
 
@@ -858,8 +861,15 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             buf: list[str] = []
             out_tok = 0
 
-            def on_reasoning(_t: str) -> None:
+            def on_reasoning(t: str) -> None:
+                nonlocal reasoning_line_buf
                 spinner.set("reasoning")
+                reasoning_line_buf += t
+                while "\n" in reasoning_line_buf:
+                    line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
+                    ln = gray("  " + line.rstrip("\r"))
+                    spinner.println(ln)
+                    session.log("meta", ln)
 
             def on_text(t: str, _b: list = buf) -> None:
                 nonlocal out_tok
@@ -873,6 +883,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                     messages=session.messages,
                     tools=TOOL_SCHEMAS,
                     temperature=cfg.temperature,
+                    thinking={"type": "enabled"},
                     on_text=on_text,
                     on_reasoning=on_reasoning,
                 )
@@ -887,6 +898,13 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             dm = session.usage["prompt_cache_miss_tokens"] - start_miss
             spinner.set_prompt_cost(dh / 1e6 * p["cache_hit"] + dm / 1e6 * p["cache_miss"])
             spinner.set_cache_stats(dh, dm)
+
+            # Flush any partial reasoning line left in the buffer.
+            if reasoning_line_buf:
+                ln = gray("  " + reasoning_line_buf.rstrip("\r"))
+                spinner.println(ln)
+                session.log("meta", ln)
+                reasoning_line_buf = ""
 
             tool_calls = result.message.get("tool_calls")
             if not tool_calls:
@@ -1109,7 +1127,7 @@ def cmd_help(state: State, args: str) -> None:
     print(bold("Commands:"))
     for name, desc in [
         ("/sessions", "list saved sessions; /sessions <id|#> to resume one"),
-        ("/clear", "archive the current session and start a fresh one"),
+        ("/new", "archive the current session and start a fresh one"),
         ("/connect", "configure & test the DeepSeek connection (API key, model)"),
         ("/memory", "view memory; /memory add <text> | rm <id> | clear"),
         ("/model", "show or set the model (applies to new sessions)"),
@@ -1223,7 +1241,7 @@ def cmd_model(state: State, args: str) -> None:
         return
     state.cfg.model = args.strip()
     state.cfg.save()
-    print(green(f"Default model set to {state.cfg.model}. Use /clear to start a session on it."))
+    print(green(f"Default model set to {state.cfg.model}. Use /new to start a session on it."))
 
 
 def cmd_mode(state: State, args: str) -> None:
@@ -1309,7 +1327,7 @@ def cmd_compact(state: State, args: str) -> None:
 COMMANDS = {
     "/help": cmd_help, "/?": cmd_help,
     "/sessions": cmd_sessions,
-    "/clear": cmd_clear,
+    "/new": cmd_clear,
     "/connect": cmd_connect,
     "/memory": cmd_memory,
     "/model": cmd_model,
@@ -1758,10 +1776,10 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
             act = ed.handle(ch, lambda: keys.getch(0.05))
             if act == "submit":
                 text = ed.text()
-                # clear the field's input rows, then echo the line into the flow
-                # (bold). image paths show as compact markers, but the raw text is
+                # clear the field's input rows, then echo the line into the flow.
+                # image paths show as compact markers, but the raw text is
                 # what we return (and what the turn turns into image attachments).
-                shown = bold(_input_display(text))
+                shown = _input_display(text)
                 if _Dock.active:
                     flow = flow_row()
                     # input rows sit two below the flow's last row (top border
@@ -2036,7 +2054,9 @@ class TypeAhead:
             if text:
                 self.queue.append(text)
             self._editor.set_text("")
-            return (dim("  + queued: ") + text) if text else None
+            if not text:
+                return None
+            return "\n".join(dim("  + queued: " + ln) for ln in text.split("\n"))
 
     def _nav_queue(self, direction: int) -> Optional[str]:
         """Up (-1) / Down (+1) through queued prompts for editing. Up from the
@@ -2109,7 +2129,7 @@ def _replay_conversation(state: State) -> None:
     for msg in session.messages:
         role, content = msg.get("role", ""), msg.get("content", "")
         if role == "user" and content and isinstance(content, str):
-            print("\n" + bold(green("› ")) + bold(content))
+            print("\n" + bold(magenta("▸ ")) + _input_display(content))
         elif role == "assistant" and content:
             print("\n" + render_assistant(content))
 
@@ -2159,7 +2179,7 @@ def main() -> None:
     if sessions:
         _replay_conversation(state)
     typeahead = TypeAhead(state)
-    prompt_fn = lambda: mode_badge(state.approval_mode) + bold(green("› "))  # noqa: E731
+    prompt_fn = lambda: bold(magenta("▸ "))  # noqa: E731
     docked = _raw_capable()
     try:
         _main_loop(state, cfg, typeahead, prompt_fn, docked)
@@ -2180,7 +2200,7 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
         if from_queue:
             # a prompt queued while the previous turn ran — echo it like input
             line = typeahead.queue.popleft().strip()
-            print(("\n" if docked else "") + prompt_fn() + bold(_input_display(line)) + dim("  (queued)"))
+            print(("\n" if docked else "") + prompt_fn() + _input_display(line) + dim("  (queued)"))
         else:
             try:
                 line = read_line(prompt_fn, state, initial=typeahead.take_text()).strip()
@@ -2209,7 +2229,7 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
             print(yellow("Not connected. Run /connect to set your DeepSeek API key."))
             continue
 
-        echo = prompt_fn() + bold(_input_display(line)) + (dim("  (queued)") if from_queue else "")
+        echo = prompt_fn() + _input_display(line) + (dim("  (queued)") if from_queue else "")
         state.session.log("user", "\n" + echo)
         try:
             run_turn(state, line, typeahead)
