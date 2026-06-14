@@ -900,6 +900,13 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                 # …and, for mutating tools, the diff/preview via the confirm gate
                 out = execute(fn["name"], fn["arguments"],
                               confirm=_make_confirm(spinner, state, typeahead))
+                if fn["name"] == "save_memory":
+                    try:
+                        mem_text = json.loads(fn.get("arguments", "{}")).get("text", "")[:80]
+                    except (json.JSONDecodeError, TypeError):
+                        mem_text = ""
+                    if mem_text:
+                        _say(session, "meta", green("  ✓ ") + mem_text, spinner)
                 session.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
             # loop so the model can read the tool results
     except KeyboardInterrupt:
@@ -1039,7 +1046,7 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
     if name == "run_bash":
         return dim(f"  {yellow('run')} {bold(str(args.get('command', '')))}")
     if name == "save_memory":
-        return magenta("  ✦ ") + magenta(bold("remembering ")) + str(args.get("text", ""))[:100]
+        return dim(f"  {magenta('memory')} {(args.get('text', '') or '')[:100]}")
     if name in ("read_file",):
         return dim(f"  {blue('read')} {bold(str(args.get('path', '?')))}")
     return dim(f"  {blue(name)} {dim(str(args))}")
@@ -1086,7 +1093,7 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
                 return ans in ("y", "yes")
 
             # in-workspace mutating tools (edit_file / create_file / run_bash / save_memory)
-            if name in ("edit_file", "create_file", "save_memory"):
+            if name in ("edit_file", "create_file"):
                 _say(session, "meta", _confirm_preview(name, args, reason), sp)
             if _auto_approves(state.approval_mode, name, reason):
                 return True
