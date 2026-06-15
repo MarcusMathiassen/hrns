@@ -911,12 +911,11 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
         took = time.monotonic() - reasoning_t0
         if collapsed:
             spinner.set_tail("")  # drop the ephemeral live preview
-            line = gray("  ") + PHASE_REASON + gray(f" thought for {took:.0f}s · {reasoning_lines} lines")
+            line = gray("  ") + PHASE_REASON + gray(f" {took:.0f}s · {reasoning_lines} lines")
         elif reasoning_lines <= 1:
-            # single-line thought: compact close — no bulky ╰ footer
             line = gray(f"  ╰ {took:.0f}s")
         else:
-            line = gray(f"  ╰ thought for {took:.0f}s · {reasoning_lines} lines")
+            line = gray(f"  ╰ {took:.0f}s · {reasoning_lines} lines")
         spinner.println(line)
         session.log("meta", line)
 
