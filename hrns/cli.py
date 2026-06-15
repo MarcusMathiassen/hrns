@@ -1651,8 +1651,8 @@ def statusline(state: State) -> str:
         # --- what -------------------------------------------------
         bold(provider_label) + "/" + cyan(_model_name(s.model)),
         # --- cache ------------------------------------------------
-        green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),
-        _cache_age(s, state.cfg.provider),
+        (green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%")
+         + "/" + _cache_age(s, state.cfg.provider)),
         # --- cost -------------------------------------------------
         yellow(_money(cost)) + "/" + yellow(f"${bal:.2f}" if bal is not None else "--"),
         # --- tokens -----------------------------------------------
