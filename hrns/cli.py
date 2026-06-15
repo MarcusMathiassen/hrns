@@ -802,7 +802,7 @@ def _input_display(text: str) -> str:
     if images:
         marks = " ".join(cyan(f"[🖼 {p.name}]") for p in images)
         text = (cleaned + " " + marks) if cleaned else marks
-    return "\n".join(bold(ln) for ln in text.split("\n"))
+    return "\r\n".join(bold(ln) for ln in text.split("\n"))
 
 
 def build_user_message(text: str) -> tuple[Any, int]:
@@ -1543,6 +1543,8 @@ class LineEditor:
     def __init__(self, text: str = "") -> None:
         self.buf: list[str] = list(text)
         self.cursor = len(self.buf)
+        self._in_paste = False
+        self._paste_buf: list[str] = []
 
     def text(self) -> str:
         return "".join(self.buf)
@@ -1590,6 +1592,11 @@ class LineEditor:
         literal newline (multi-line prompts). Backspace deletes a char; Ctrl+W
         and Ctrl/Shift+Backspace (where the terminal encodes the modifier, plus
         Ctrl-H) delete the previous word."""
+        if self._in_paste:                            # paste — batch everything except ESC
+            if ch == "\x1b":                          # let \e[201~ through to _escape()
+                return self._escape(getch)
+            self._paste_buf.append(ch)                # raw — line-endings normalised at flush
+            return "edit"
         if ch == "\r":                                # Enter — submit
             return "submit"
         if ch == "\n":                                # newline (paste / Ctrl+J) — insert
@@ -1620,7 +1627,7 @@ class LineEditor:
             self._delete_word_left()
         elif ch == "\x1b":
             return self._escape(getch)
-        elif ch.isprintable():
+        elif ch.isprintable() and not self._in_paste:
             self._insert(ch)
         return "edit"
 
@@ -1683,6 +1690,21 @@ class LineEditor:
             return "edit"
         if final == "~":                              # CSI n [; mods] ~
             n = nums[0] if nums else 0
+            if n == 200:                              # bracketed-paste begin
+                self._paste_buf.clear()
+                self._in_paste = True
+                return "edit"
+            if n == 201:                              # bracketed-paste end
+                self._in_paste = False
+                if self._paste_buf:
+                    # normalise \r\n and bare \r → \n, then splice once
+                    text = "".join(self._paste_buf)
+                    text = text.replace("\r\n", "\n").replace("\r", "\n")
+                    tail = list(text)
+                    self.buf[self.cursor:self.cursor] = tail
+                    self.cursor += len(tail)
+                    self._paste_buf = []
+                return "edit"
             if n in (1, 7):
                 self.cursor = 0                       # Home
             elif n in (4, 8):
@@ -1764,6 +1786,8 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
 
     try:
         tty.setraw(fd)
+        sys.stdout.write("\033[?2004h")   # enable bracketed paste
+        sys.stdout.flush()
         redraw()                          # establishes/normalizes the dock
         while True:
             if not keys.ready(1.0):       # 1s tick — keeps the cache-age alive
@@ -1820,6 +1844,8 @@ def read_line(prompt_fn, state: State, initial: str = "") -> str:
             if not keys.ready(0):
                 redraw()
     finally:
+        sys.stdout.write("\033[?2004l")   # disable bracketed paste
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
