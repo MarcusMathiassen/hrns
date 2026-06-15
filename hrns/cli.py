@@ -110,14 +110,14 @@ def _cache_age(session: Session, provider: str = "deepseek") -> str:
     try:
         updated = datetime.fromisoformat(session.updated_at)
     except (ValueError, TypeError):
-        return dim("cache --")
+        return dim("--")
     ttl = _CACHE_TTL.get(provider, 300)
     age = (datetime.now(timezone.utc) - updated).total_seconds()
     remaining = max(0, ttl - age)
     if age < 0 or remaining <= 0:
-        return red("cache expired")
+        return red("expired")
     m, s = divmod(int(remaining), 60)
-    label = f"cache {m}m {s}s" if m else f"cache {s}s"
+    label = f"{m}m {s}s" if m else f"{s}s"
     if remaining > 180:
         return green(label)
     if remaining > 60:
