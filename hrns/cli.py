@@ -1638,6 +1638,12 @@ def statusline(state: State) -> str:
         gparts.append(yellow(f"?{untracked}"))
 
     provider_label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
+    # build context segment: ctx / cum [· %]
+    ctx_seg = f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"
+    cw = context_window(s.model)
+    if cw:
+        ctx_pct = s.context_tokens / cw * 100
+        ctx_seg += f" · {ctx_pct:.1f}%"
     segs = [
         # --- where -------------------------------------------------
         (dim(repo) + " " + blue(f"({branch})")) if branch else dim(repo),
@@ -1650,13 +1656,9 @@ def statusline(state: State) -> str:
         # --- cost -------------------------------------------------
         yellow(_money(cost)) + "/" + yellow(f"${bal:.2f}" if bal is not None else "--"),
         # --- tokens -----------------------------------------------
-        magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),
+        magenta(ctx_seg),
         dim(f"v{__version__}"),
     ]
-    cw = context_window(s.model)
-    if cw:
-        ctx_pct = s.context_tokens / cw * 100
-        segs.append(magenta(f"{ctx_pct:.1f}%"))
     return dim(" · ").join(seg for seg in segs if seg)
 
 
