@@ -912,6 +912,9 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
         if collapsed:
             spinner.set_tail("")  # drop the ephemeral live preview
             line = gray("  ") + PHASE_REASON + gray(f" thought for {took:.0f}s · {reasoning_lines} lines")
+        elif reasoning_lines <= 1:
+            # single-line thought: compact close — no bulky ╰ footer
+            line = gray(f"  ╰ {took:.0f}s")
         else:
             line = gray(f"  ╰ thought for {took:.0f}s · {reasoning_lines} lines")
         spinner.println(line)
@@ -924,10 +927,8 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             reasoning_open = True
             reasoning_t0 = time.monotonic()
             reasoning_lines = 0
-            if not collapsed:
-                head = gray("  ╭ thinking")
-                spinner.println(head)
-                session.log("meta", head)
+            # no "╭ thinking" header — the │ prefix alone signals reasoning;
+            # the close rule provides the duration and line count.
         spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
         reasoning_line_buf += t
         while "\n" in reasoning_line_buf:
