@@ -1640,7 +1640,7 @@ def statusline(state: State) -> str:
     provider_label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
     segs = [
         # --- where -------------------------------------------------
-        dim(repo) + "/ " + blue(f"({branch})") if branch else dim(repo),
+        (dim(repo) + " " + blue(f"({branch})")) if branch else dim(repo),
         " ".join(gparts),
         # --- what -------------------------------------------------
         bold(provider_label) + "/" + cyan(_model_name(s.model)),
@@ -1648,8 +1648,7 @@ def statusline(state: State) -> str:
         green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),
         _cache_age(s, state.cfg.provider),
         # --- cost -------------------------------------------------
-        yellow(_money(cost)),
-        yellow(f"${bal:.2f}" if bal is not None else "--"),
+        yellow(_money(cost)) + "/" + yellow(f"${bal:.2f}" if bal is not None else "--"),
         # --- tokens -----------------------------------------------
         magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),
         dim(f"v{__version__}"),
