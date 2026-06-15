@@ -1084,12 +1084,15 @@ def _tool_label(fn: dict) -> str:
 
 
 def _diff_preview(old: str, new: str, limit: int = 14) -> list[str]:
-    """Colored +/- diff lines, limited to `limit` lines."""
+    """Colored +/- diff lines with hunk headers (line numbers), limited to
+    `limit` lines."""
     lines = []
-    for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=1):
-        if ln.startswith(("---", "+++", "@@")):
+    for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=2):
+        if ln.startswith(("---", "+++")):
             continue
-        if ln.startswith("+"):
+        if ln.startswith("@@"):
+            lines.append(cyan(ln))
+        elif ln.startswith("+"):
             lines.append(green(ln))
         elif ln.startswith("-"):
             lines.append(red(ln))
