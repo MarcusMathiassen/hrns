@@ -1180,15 +1180,10 @@ def cmd_connect(state: State, args: str) -> None:
     cfg = state.cfg
     provider = cfg.provider
     labels = {"deepseek": "DeepSeek", "openrouter": "OpenRouter"}
-    label = labels.get(provider, "API")
+    label = labels.get(provider, cfg.base_url)
     print(bold(f"Connect to {label}"))
 
-    # 1. base_url
-    print(dim(f"  base_url [{cfg.base_url}]:"), end=" ")
-    base = input().strip() or cfg.base_url
-    cfg.base_url = base
-
-    # 2. api key (need it to list models)
+    # 1. api key
     have = "set" if cfg.api_key else "unset"
     key = getpass.getpass(f"  api key (currently {have}, blank = keep): ").strip()
     if key:
@@ -1197,7 +1192,7 @@ def cmd_connect(state: State, args: str) -> None:
         print(red("No API key available — cannot connect."))
         return
 
-    # 3. connect and fetch models
+    # 2. connect and fetch models
     try:
         client = DeepSeekClient(cfg.api_key, cfg.base_url, cfg.provider)
         models = client.list_models()
@@ -1205,9 +1200,8 @@ def cmd_connect(state: State, args: str) -> None:
         print(red(f"Connection failed: {e}"))
         return
 
-    # 4. pick model — use interactive list if terminal supports it
+    # 3. pick model — interactive list if terminal supports it
     if models and _raw_capable():
-        # Put the current model at the top of the list for quick access
         if cfg.model in models:
             models = [models.pop(models.index(cfg.model))] + models
         chosen = pick_from_list(models, f"Select model ({label})")
@@ -1216,7 +1210,6 @@ def cmd_connect(state: State, args: str) -> None:
         else:
             print(yellow("Selection cancelled — keeping current model."))
     else:
-        # fallback: text input
         print(dim(f"  model [{cfg.model}]:"), end=" ")
         model = input().strip() or cfg.model
         cfg.model = model
@@ -1227,6 +1220,7 @@ def cmd_connect(state: State, args: str) -> None:
     here = green("available") if cfg.model in models else yellow("not in /models list")
     print(f"{ok} · {len(models)} models · '{cfg.model}' {here}")
     print(dim(f"  saved to {cfg.config_path} — hrns will reconnect automatically next run"))
+    print(dim(f"  to switch provider set HRNS_BASE_URL or base_url in {cfg.config_path}"))
 
 
 def cmd_memory(state: State, args: str) -> None:

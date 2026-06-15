@@ -138,7 +138,10 @@ class Config:
         saved = storage.read_json(home / "config.json", default={}) or {}
 
         cfg = cls(home=home)
-        cfg.base_url = saved.get("base_url", cfg.base_url)
+        cfg.base_url = (
+            os.environ.get("HRNS_BASE_URL")          # env override
+            or saved.get("base_url", cfg.base_url)
+        )
         cfg.model = saved.get("model", cfg.model)
         cfg.temperature = saved.get("temperature", cfg.temperature)
         cfg.approval_mode = saved.get("approval_mode", cfg.approval_mode)
