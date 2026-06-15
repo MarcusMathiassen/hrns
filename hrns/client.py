@@ -111,7 +111,8 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        # DeepSeek-specific params — harmless if ignored by other providers
+        # --- provider-specific optimizations -------------------------------
+        # DeepSeek: prefix=True enables on-disk KV caching (~5 min TTL).
         if self.provider == "deepseek":
             payload["prefix"] = True
         if thinking is not None and self.provider == "deepseek":
@@ -119,6 +120,15 @@ class DeepSeekClient:
             payload["reasoning_effort"] = reasoning_effort
         else:
             payload["temperature"] = temperature
+        # OpenRouter: `provider` is a routing-preferences object (an OpenRouter
+        # extension, ignored by other endpoints). It has no `cache` key —
+        # prompt caching is automatic for providers that support it (DeepSeek,
+        # OpenAI, Gemini) or driven by `cache_control` breakpoints (Anthropic),
+        # never a per-request flag. Only `order` is valid here.
+        if self.provider == "openrouter":
+            payload["provider"] = {
+                "order": ["DeepSeek", "Anthropic", "OpenAI", "Google", "Meta"],
+            }
         if tools:
             payload["tools"] = tools
 

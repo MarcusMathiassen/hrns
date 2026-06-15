@@ -358,6 +358,7 @@ class Spinner:
         self.state = state
         self._label = "working"
         self._glyph = ""  # static phase marker shown before the label
+        self._tail = ""   # ephemeral text (e.g. live reasoning) after the label
         self._lock = threading.Lock()
         self._io = threading.Lock()  # serialises stdout between threads
         self._stop = threading.Event()
@@ -395,6 +396,13 @@ class Spinner:
         with self._lock:
             self._label = label
             self._glyph = glyph
+
+    def set_tail(self, tail: str) -> None:
+        """Ephemeral text shown after the label on the status row — overwritten
+        each frame and never committed to scrollback (used for the live
+        reasoning preview in collapsed mode)."""
+        with self._lock:
+            self._tail = tail
 
     def set_prompt_tokens(self, n: int) -> None:
         self.prompt_tokens = n
@@ -436,6 +444,7 @@ class Spinner:
         with self._lock:
             label = self._label
             glyph = self._glyph
+            tail = self._tail
         if glyph:
             label = glyph + " " + label
         extra_fn = self.extra
@@ -454,6 +463,13 @@ class Spinner:
         head += dim(" · ") + label
         if extra:
             head += " " + extra
+        if tail:
+            cols = shutil.get_terminal_size().columns
+            used = len(_ANSI.sub("", head))
+            room = cols - used - 4          # leave a little slack at the edge
+            if room >= 8:
+                snippet = tail if len(tail) <= room else "…" + tail[-(room - 1):]
+                head += dim("  " + snippet)
         with self._io:
             if self._paused.is_set() or self._stop.is_set():
                 return
@@ -881,42 +897,60 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     reasoning_t0 = 0.0            # when reasoning started, for the close rule
     error: Optional[str] = None
     interrupted = False
+    # collapsed: reasoning rolls live on the status row and collapses to a one-
+    # line summary; full: every reasoning line is printed into scrollback. Either
+    # way the complete stream is kept in the transcript via session.log.
+    collapsed = cfg.reasoning_display != "full"
 
     def _close_thinking() -> None:
-        """Print the closing rule once, when reasoning gives way to output."""
+        """Close the thinking block once, when reasoning gives way to output."""
         nonlocal reasoning_open
         if not reasoning_open:
             return
         reasoning_open = False
         took = time.monotonic() - reasoning_t0
-        rule = gray(f"  ╰ thought for {took:.0f}s · {reasoning_lines} lines")
-        spinner.println(rule)
-        session.log("meta", rule)
+        if collapsed:
+            spinner.set_tail("")  # drop the ephemeral live preview
+            line = gray("  ") + PHASE_REASON + gray(f" thought for {took:.0f}s · {reasoning_lines} lines")
+        else:
+            line = gray(f"  ╰ thought for {took:.0f}s · {reasoning_lines} lines")
+        spinner.println(line)
+        session.log("meta", line)
+
+    def _on_reasoning(t: str) -> None:
+        nonlocal reasoning_line_buf, reasoning_lines
+        nonlocal reasoning_open, reasoning_t0
+        if not reasoning_open:
+            reasoning_open = True
+            reasoning_t0 = time.monotonic()
+            reasoning_lines = 0
+            if not collapsed:
+                head = gray("  ╭ thinking")
+                spinner.println(head)
+                session.log("meta", head)
+        spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
+        reasoning_line_buf += t
+        while "\n" in reasoning_line_buf:
+            line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
+            line = line.rstrip("\r")
+            reasoning_lines += 1
+            session.log("meta", gray("  │ " + line))
+            if collapsed:
+                stripped = line.strip()
+                if stripped:
+                    spinner.set_tail(stripped)    # live preview, ephemeral
+            else:
+                spinner.println(gray("  │ " + line))
+            spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
+        if collapsed and reasoning_line_buf:
+            stripped = reasoning_line_buf.strip()
+            if stripped:
+                spinner.set_tail(stripped)         # partial line too
 
     try:
         while True:
             buf: list[str] = []
             out_tok = 0
-
-            def on_reasoning(t: str) -> None:
-                nonlocal reasoning_line_buf, reasoning_lines
-                nonlocal reasoning_open, reasoning_t0
-                if not reasoning_open:
-                    reasoning_open = True
-                    reasoning_t0 = time.monotonic()
-                    reasoning_lines = 0
-                    head = gray("  ╭ thinking")
-                    spinner.println(head)
-                    session.log("meta", head)
-                spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
-                reasoning_line_buf += t
-                while "\n" in reasoning_line_buf:
-                    line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
-                    reasoning_lines += 1
-                    ln = gray("  │ " + line.rstrip("\r"))
-                    spinner.println(ln)
-                    session.log("meta", ln)
-                    spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
 
             def on_text(t: str, _b: list = buf) -> None:
                 nonlocal out_tok
@@ -934,7 +968,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                     temperature=cfg.temperature,
                     thinking={"type": "enabled"} if cfg.provider == "deepseek" else None,
                     on_text=on_text,
-                    on_reasoning=on_reasoning,
+                    on_reasoning=_on_reasoning,
                 )
             except DeepSeekError as e:
                 error = str(e)
@@ -952,8 +986,13 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             if reasoning_line_buf:
                 reasoning_lines += 1
                 ln = gray("  │ " + reasoning_line_buf.rstrip("\r"))
-                spinner.println(ln)
                 session.log("meta", ln)
+                if collapsed:
+                    stripped = reasoning_line_buf.strip()
+                    if stripped:
+                        spinner.set_tail(stripped)
+                else:
+                    spinner.println(ln)
                 reasoning_line_buf = ""
 
             _close_thinking()  # tools or the final answer end the thinking block
@@ -1184,6 +1223,7 @@ def cmd_help(state: State, args: str) -> None:
         ("/memory", "view memory; /memory add <text> | rm <id> | clear"),
         ("/model", "show or set the model (applies to new sessions)"),
         ("/mode", "cycle approval: confirm → auto-edit → auto (or Shift+Tab)"),
+        ("/reasoning", "toggle reasoning display: full (scrollback) | collapsed (status row)"),
         ("/stats", "cumulative token + cache stats for this session"),
         ("/compact", "summarise history and replace it with a compact summary"),
         ("/help", "show this help"),
@@ -1376,6 +1416,21 @@ def cmd_mode(state: State, args: str) -> None:
           f"{dim('— ' + _MODE_DESC[state.approval_mode])}")
 
 
+def cmd_reasoning(state: State, args: str) -> None:
+    arg = args.strip()
+    cfg = state.cfg
+    if arg:
+        if arg not in ("collapsed", "full"):
+            print(red(f"Unknown mode '{arg}'. Options: collapsed, full"))
+            return
+        cfg.reasoning_display = arg
+    else:
+        cfg.reasoning_display = "full" if cfg.reasoning_display == "collapsed" else "collapsed"
+    cfg.save()
+    label = "collapsed (live status row)" if cfg.reasoning_display == "collapsed" else "full (scrollback)"
+    print(f"reasoning display: {green(cfg.reasoning_display)} {dim('— ' + label)}")
+
+
 def cmd_stats(state: State, args: str) -> None:
     s = state.session
     u = s.usage
@@ -1449,6 +1504,7 @@ COMMANDS = {
     "/memory": cmd_memory,
     "/model": cmd_model,
     "/mode": cmd_mode,
+    "/reasoning": cmd_reasoning,
     "/stats": cmd_stats,
     "/compact": cmd_compact,
 }

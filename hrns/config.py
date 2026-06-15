@@ -114,8 +114,10 @@ class Config:
     model: str = DEFAULT_MODEL
     temperature: float = 0.3
     approval_mode: str = "confirm"
+    reasoning_display: str = "full"      # "full" | "collapsed"
     balance: float | None = None  # cached from balance endpoint
     home: Path = field(default_factory=lambda: Path(os.environ.get("HRNS_HOME", Path.home() / ".hrns")))
+    api_keys: dict[str, str] = field(default_factory=dict)  # provider → key
 
     # --- derived --------------------------------------------------------
     @property
@@ -148,13 +150,16 @@ class Config:
         cfg.model = saved.get("model", cfg.model)
         cfg.temperature = saved.get("temperature", cfg.temperature)
         cfg.approval_mode = saved.get("approval_mode", cfg.approval_mode)
+        cfg.reasoning_display = saved.get("reasoning_display", cfg.reasoning_display)
+        cfg.api_keys = saved.get("api_keys", {}) or {}
 
         provider = cfg.provider
         key_env = _PROVIDER_API_KEY_ENV.get(provider, "DEEPSEEK_API_KEY")
         dotenv = _load_dotenv(Path.cwd() / ".env")
         cfg.api_key = (
             os.environ.get(key_env)              # explicit per-process override
-            or saved.get("api_key")              # remembered from a previous /connect
+            or cfg.api_keys.get(provider)         # per-provider stored key
+            or saved.get("api_key")              # legacy single key
             or dotenv.get(key_env)               # project .env (first-run bootstrap)
         )
         return cfg
@@ -173,9 +178,12 @@ class Config:
             "model": self.model,
             "temperature": self.temperature,
             "approval_mode": self.approval_mode,
+            "reasoning_display": self.reasoning_display,
+            "api_keys": self.api_keys,
         })
         if include_key:
-            data["api_key"] = self.api_key
+            self.api_keys[self.provider] = self.api_key
+            data["api_keys"] = self.api_keys
         storage.write_json(self.config_path, data)
         try:
             os.chmod(self.config_path, 0o600)
