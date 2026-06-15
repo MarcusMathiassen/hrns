@@ -1072,13 +1072,21 @@ def _tool_label(fn: dict) -> str:
     }.get(name, name)
 
 
-def _diff_preview(old: str, new: str) -> list[str]:
-    """Colored +/- diff lines with hunk headers (line numbers)."""
+def _diff_preview(old: str, new: str, start_line: int = 1) -> list[str]:
+    """Colored +/- diff lines with hunk headers (line numbers).  `start_line`
+    is the 1-based line in the file where `old` begins, so hunk offsets are
+    relative to the actual file."""
     lines = []
     for ln in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=2):
         if ln.startswith(("---", "+++")):
             continue
         if ln.startswith("@@"):
+            # shift the hunk header's line numbers by the file offset
+            def _shift(m: re.Match) -> str:
+                old_start = int(m.group(1)) + start_line - 1
+                new_start = int(m.group(3)) + start_line - 1
+                return f"@@ -{old_start},{m.group(2)} +{new_start},{m.group(4)} @@"
+            ln = re.sub(r"@@ -(\d+),(\d+) \+(\d+),(\d+) @@", _shift, ln)
             lines.append(cyan(ln))
         elif ln.startswith("+"):
             lines.append(green(ln))
@@ -1131,7 +1139,16 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
         new = args.get("new_string", "")
         head = f"{magenta('edit')} {bold(path)}"
         extra = dim(" (replace_all)") if args.get("replace_all") else ""
-        diff = "\n".join("    " + ln for ln in _diff_preview(old, new))
+        # find the line offset so hunk headers show real file line numbers
+        start_line = 1
+        try:
+            file_text = Path(path).read_text()
+            idx = file_text.find(old)
+            if idx != -1:
+                start_line = file_text[:idx].count("\n") + 1
+        except (OSError, UnicodeDecodeError):
+            pass
+        diff = "\n".join("    " + ln for ln in _diff_preview(old, new, start_line))
         return f"  {head}{extra}\n{diff}"
     if name == "create_file":
         content = args.get("content", "")
