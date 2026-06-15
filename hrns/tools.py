@@ -96,7 +96,12 @@ def _is_outside(path_str: str) -> bool:
     p = Path(str(path_str)).expanduser()
     if not p.is_absolute():
         p = WORKSPACE_ROOT / p
-    return not Path(os.path.realpath(str(p))).is_relative_to(WORKSPACE_ROOT)
+    rp = Path(os.path.realpath(str(p)))
+    try:
+        return not rp.is_relative_to(WORKSPACE_ROOT)
+    except ValueError:
+        # Python 3.9–3.12 raise ValueError for non-relative paths
+        return True
 
 
 def _escape_path(name: str, args: dict) -> str | None:

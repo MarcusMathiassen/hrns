@@ -2,8 +2,9 @@
 
 Resolution order for the API key:
     1. PROVIDER_API_KEY in the environment   (explicit per-process override)
-    2. api_key saved in ~/.hrns/config.json  (remembered from a previous /connect)
-    3. PROVIDER_API_KEY in a project-local .env (first-run bootstrap only)
+    2. per-provider key in ~/.hrns/config.json (remembered from a previous /connect)
+    3. legacy api_key in ~/.hrns/config.json (migration from single-key storage)
+    4. PROVIDER_API_KEY in a project-local .env (first-run bootstrap only)
 
 The provider is auto-detected from the base_url — "deepseek" for
 api.deepseek.com, "openrouter" for openrouter.ai.

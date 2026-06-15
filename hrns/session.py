@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hrns import storage
+from hrns.config import DEFAULT_MODEL
 
 
 def _now() -> str:
@@ -83,7 +84,7 @@ class Session:
     def from_dict(cls, data: dict[str, Any]) -> "Session":
         s = cls(
             id=data["id"],
-            model=data.get("model", "deepseek-v4-pro"),
+            model=data.get("model", DEFAULT_MODEL),
             created_at=data.get("created_at", _now()),
             updated_at=data.get("updated_at", _now()),
             messages=data.get("messages", []),
