@@ -1182,20 +1182,22 @@ def cmd_connect(state: State, args: str) -> None:
     labels = {"deepseek": "DeepSeek", "openrouter": "OpenRouter"}
     label = labels.get(provider, "API")
     print(bold(f"Connect to {label}"))
+
+    # 1. base_url
     print(dim(f"  base_url [{cfg.base_url}]:"), end=" ")
     base = input().strip() or cfg.base_url
-    print(dim(f"  model [{cfg.model}]:"), end=" ")
-    model = input().strip() or cfg.model
+    cfg.base_url = base
+
+    # 2. api key (need it to list models)
     have = "set" if cfg.api_key else "unset"
     key = getpass.getpass(f"  api key (currently {have}, blank = keep): ").strip()
-
-    cfg.base_url, cfg.model = base, model
     if key:
         cfg.api_key = key
     if not cfg.api_key:
         print(red("No API key available — cannot connect."))
         return
 
+    # 3. connect and fetch models
     try:
         client = DeepSeekClient(cfg.api_key, cfg.base_url, cfg.provider)
         models = client.list_models()
@@ -1203,11 +1205,27 @@ def cmd_connect(state: State, args: str) -> None:
         print(red(f"Connection failed: {e}"))
         return
 
+    # 4. pick model — use interactive list if terminal supports it
+    if models and _raw_capable():
+        # Put the current model at the top of the list for quick access
+        if cfg.model in models:
+            models = [models.pop(models.index(cfg.model))] + models
+        chosen = pick_from_list(models, f"Select model ({label})")
+        if chosen:
+            cfg.model = chosen
+        else:
+            print(yellow("Selection cancelled — keeping current model."))
+    else:
+        # fallback: text input
+        print(dim(f"  model [{cfg.model}]:"), end=" ")
+        model = input().strip() or cfg.model
+        cfg.model = model
+
     state.client = client
     cfg.save(include_key=True)
     ok = green("✓ connected")
-    here = green("available") if model in models else yellow("not in /models list")
-    print(f"{ok} · {len(models)} models · '{model}' {here}")
+    here = green("available") if cfg.model in models else yellow("not in /models list")
+    print(f"{ok} · {len(models)} models · '{cfg.model}' {here}")
     print(dim(f"  saved to {cfg.config_path} — hrns will reconnect automatically next run"))
 
 
@@ -1527,6 +1545,101 @@ def _keys() -> _KeySource:
     if _KEY_SOURCE is None:
         _KEY_SOURCE = _KeySource()
     return _KEY_SOURCE
+
+
+def pick_from_list(items: list[str], title: str = "Select") -> str | None:
+    """Interactive list picker — arrow keys, enter to select, esc to cancel.
+
+    Renders directly into the terminal, restores the cursor position on exit.
+    Returns the selected item or None on cancel. Requires raw-mode terminal."""
+    n = len(items)
+    if n == 0:
+        return None
+    idx = 0
+    query = ""         # filter buffer
+    filtered = items   # items matching the query
+    keys = _keys()
+
+    # Find terminal height so we know how many items to show
+    size = shutil.get_terminal_size()
+    max_visible = max(3, min(n, size.lines - 4))
+
+    def _draw() -> None:
+        nonlocal filtered, idx
+        # If query changed, re-filter
+        if query:
+            q = query.lower().replace(" ", "")
+            filtered = [it for it in items if q in it.lower().replace(" ", "")]
+            if not filtered:
+                filtered = items
+            idx = max(0, min(idx, len(filtered) - 1))
+
+        # Scroll window so idx stays visible
+        half = max_visible // 2
+        start = max(0, min(idx - half, len(filtered) - max_visible))
+        end = start + max_visible
+
+        lines: list[str] = []
+        lines.append(f"\r\033[K{bold(cyan(title))}{dim(' · type to filter, ↑↓ to move, ↵ to select')}")
+        for i in range(start, end):
+            if i >= len(filtered):
+                break
+            prefix = " " + cyan("▸") if i == idx else "  "
+            line = prefix + " " + filtered[i]
+            if i == idx:
+                line = _c("7", line)  # reverse video for the cursor line
+            lines.append(f"\r\033[K{line}")
+        if query:
+            lines.append(f"\r\033[K{dim('filter: ' + query)}")
+        sys.stdout.write("\n".join(lines))
+        sys.stdout.flush()
+
+    # Save position, draw, then loop
+    sys.stdout.write("\0337")   # DECSC — save cursor
+    _draw()
+    try:
+        while True:
+            ch = keys.getch(10)
+            if ch == "":
+                break
+            if ch == "\x1b":
+                # Could be arrow keys or bare ESC
+                nxt = keys.getch(0.05)
+                if nxt == "[":
+                    code = keys.getch(0.05)
+                    if code == "A":      # up
+                        idx = max(0, idx - 1)
+                    elif code == "B":    # down
+                        idx = min(len(filtered) - 1, idx + 1)
+                elif nxt == "":
+                    return None          # bare ESC = cancel
+                else:
+                    continue
+            elif ch == "\r":
+                if filtered and 0 <= idx < len(filtered):
+                    return filtered[idx]
+            elif ch in ("\x03", "\x04"):
+                return None              # Ctrl+C / Ctrl+D = cancel
+            elif ch == "\x7f":           # backspace
+                query = query[:-1]
+            elif ch.isprintable():
+                query += ch
+            else:
+                continue
+            # Reset filter on empty query
+            if not query:
+                filtered = items
+            # Move cursor back up and redraw
+            visible_lines = min(max_visible, len(filtered)) + (2 if query else 1)
+            sys.stdout.write(f"\033[{visible_lines}A")
+            _draw()
+    finally:
+        # Restore cursor and clear picker area
+        sys.stdout.write("\0338")        # DECRC — restore cursor
+        # Clear the lines we drew (they're above the restored cursor)
+        visible_lines = min(max_visible, len(filtered)) + 3
+        sys.stdout.write("\n" * visible_lines + f"\033[{visible_lines}A")
+        sys.stdout.flush()
 
 
 class LineEditor:
