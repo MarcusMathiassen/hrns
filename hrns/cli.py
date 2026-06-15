@@ -893,41 +893,30 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     final_text = ""
     reasoning_line_buf = ""       # partial line accumulator for streamed reasoning
     reasoning_lines = 0           # completed reasoning lines this turn
-    reasoning_open = False        # the "thinking" rule has been printed
-    reasoning_t0 = 0.0            # when reasoning started, for the close rule
+    reasoning_open = False        # reasoning stream is in progress
     error: Optional[str] = None
     interrupted = False
-    # collapsed: reasoning rolls live on the status row and collapses to a one-
-    # line summary; full: every reasoning line is printed into scrollback. Either
-    # way the complete stream is kept in the transcript via session.log.
+    # collapsed: reasoning rolls live on the status row; full: each reasoning
+    # line is printed into scrollback with a │ prefix.  Either way the complete
+    # stream is kept in the transcript via session.log.
     collapsed = cfg.reasoning_display != "full"
 
     def _close_thinking() -> None:
-        """Close the thinking block once, when reasoning gives way to output."""
+        """End the reasoning block: clear ephemeral state and, in collapsed
+        mode, drop the live tail so the spinner row returns to normal."""
         nonlocal reasoning_open
         if not reasoning_open:
             return
         reasoning_open = False
-        took = time.monotonic() - reasoning_t0
         if collapsed:
-            spinner.set_tail("")  # drop the ephemeral live preview
-            line = gray("  ") + PHASE_REASON + gray(f" {took:.0f}s · {reasoning_lines} lines")
-        elif reasoning_lines <= 1:
-            line = gray(f"  ╰ {took:.0f}s")
-        else:
-            line = gray(f"  ╰ {took:.0f}s · {reasoning_lines} lines")
-        spinner.println(line)
-        session.log("meta", line)
+            spinner.set_tail("")
 
     def _on_reasoning(t: str) -> None:
         nonlocal reasoning_line_buf, reasoning_lines
-        nonlocal reasoning_open, reasoning_t0
+        nonlocal reasoning_open
         if not reasoning_open:
             reasoning_open = True
-            reasoning_t0 = time.monotonic()
             reasoning_lines = 0
-            # no "╭ thinking" header — the │ prefix alone signals reasoning;
-            # the close rule provides the duration and line count.
         spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
         reasoning_line_buf += t
         while "\n" in reasoning_line_buf:
