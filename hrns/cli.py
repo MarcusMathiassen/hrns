@@ -1650,16 +1650,16 @@ def pick_from_list(items: list[str], title: str = "Select") -> str | None:
             if not query:
                 filtered = items
             # Move cursor back up and redraw
-            visible_lines = min(max_visible, len(filtered)) + (2 if query else 1)
+            visible_lines = min(max_visible, len(filtered)) + (1 if query else 0)
             sys.stdout.write(f"\033[{visible_lines}A")
             _draw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         # Restore cursor and clear picker area
         sys.stdout.write("\0338")        # DECRC — restore cursor
-        # Clear the lines we drew (they're above the restored cursor)
-        visible_lines = min(max_visible, len(filtered)) + 3
-        sys.stdout.write("\n" * visible_lines + f"\033[{visible_lines}A")
+        # Clear the lines we drew (they're below the restored cursor)
+        drawn = 1 + min(max_visible, len(filtered)) + (1 if query else 0)
+        sys.stdout.write("\n" * drawn + f"\033[{drawn}A")
         sys.stdout.flush()
 
 
