@@ -1613,11 +1613,12 @@ def _repo_info() -> tuple[str, str, int, int, int]:
 def statusline(state: State) -> str:
     """One colored line of session vitals, rendered above each input prompt.
 
-    Order: model · cache-hit-rate · session-cost · balance · context/total
-    tokens · repo · branch · git-stats. Each metric gets its own color so it's
-    scannable at a glance:
-      cyan=model  green=cache hit rate  yellow=cost/balance  magenta=tokens
+    Order: repo · branch · git-stats · provider · model · cache-rate ·
+    cache-age · cost · balance · ctx/total · version · ctx%.
+    Each metric gets its own color so it's scannable at a glance:
       dim=repo  blue=branch  green/red/yellow=git +staged/-unstaged/?untracked
+      bold=provider  cyan=model  green=cache  yellow=cost/balance
+      magenta=tokens  dim=version
     """
     s = state.session
     u = s.usage
@@ -1638,19 +1639,23 @@ def statusline(state: State) -> str:
 
     provider_label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
     segs = [
-        dim(repo),                                                           # repo
-        blue(branch),                                                        # branch
-        " ".join(gparts),                                                    # git stats
-        bold(provider_label),                                                # provider
-        cyan(_model_name(s.model)),                                          # model
-        green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),    # cache hit rate
-        _cache_age(s, state.cfg.provider),                                                       # cache freshness
-        yellow(_money(cost)),                                                # session cost
-        yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
-        magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
-        dim(f"v{__version__}"),                                                  # version
+        # --- where -------------------------------------------------
+        dim(repo),
+        blue(branch),
+        " ".join(gparts),
+        # --- what -------------------------------------------------
+        bold(provider_label),
+        cyan(_model_name(s.model)),
+        # --- cache ------------------------------------------------
+        green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),
+        _cache_age(s, state.cfg.provider),
+        # --- cost -------------------------------------------------
+        yellow(_money(cost)),
+        yellow(f"${bal:.2f}" if bal is not None else "--"),
+        # --- tokens -----------------------------------------------
+        magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),
+        dim(f"v{__version__}"),
     ]
-    # context window usage %
     cw = context_window(s.model)
     if cw:
         ctx_pct = s.context_tokens / cw * 100
