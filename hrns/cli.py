@@ -67,6 +67,18 @@ def blue(t: str) -> str: return _c("34", t)
 def magenta(t: str) -> str: return _c("35", t)
 
 
+# Per-phase status markers (glyph, color). Degrade to ASCII off a TTY so piped
+# output stays clean.
+def _glyph(uni: str, ascii_: str, color) -> str:
+    return color(uni) if _TTY else ascii_
+
+
+PHASE_CALL = _glyph("◴", ".", dim)       # waiting on the API
+PHASE_REASON = _glyph("✻", "*", magenta)  # model is reasoning
+PHASE_WRITE = _glyph("✶", ">", cyan)      # model is writing the answer
+PHASE_TOOL = _glyph("◇", "-", blue)       # a tool is running
+
+
 def _human(n: int) -> str:
     """Compact token counts: 950, 12.3k, 1.4M."""
     if n >= 1_000_000:
@@ -84,20 +96,24 @@ def _money(c: float) -> str:
     return f"${c:.6f}"
 
 
-_CACHE_TTL = 300  # DeepSeek KV cache TTL in seconds
+_CACHE_TTL: dict[str, int] = {
+    "deepseek":   300,  # on-disk KV cache
+    "openrouter": 300,  # proxy-layer response cache (varies by upstream)
+}
 
 
-def _cache_age(session: Session) -> str:
-    """Colored countdown until the KV cache expires. Each API request resets
-    the clock; DeepSeek's TTL is ~5 minutes.
+def _cache_age(session: Session, provider: str = "deepseek") -> str:
+    """Colored countdown until the cache expires. Each API request resets
+    the clock. TTL varies by provider.
 
     green > 3 min, yellow > 1 min, red ≤ 1 min."""
     try:
         updated = datetime.fromisoformat(session.updated_at)
     except (ValueError, TypeError):
         return dim("cache --")
+    ttl = _CACHE_TTL.get(provider, 300)
     age = (datetime.now(timezone.utc) - updated).total_seconds()
-    remaining = max(0, _CACHE_TTL - age)
+    remaining = max(0, ttl - age)
     if age < 0 or remaining <= 0:
         return red("cache expired")
     m, s = divmod(int(remaining), 60)
@@ -341,6 +357,7 @@ class Spinner:
         self.enabled = _TTY
         self.state = state
         self._label = "working"
+        self._glyph = ""  # static phase marker shown before the label
         self._lock = threading.Lock()
         self._io = threading.Lock()  # serialises stdout between threads
         self._stop = threading.Event()
@@ -374,9 +391,10 @@ class Spinner:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def set(self, label: str) -> None:
+    def set(self, label: str, glyph: str = "") -> None:
         with self._lock:
             self._label = label
+            self._glyph = glyph
 
     def set_prompt_tokens(self, n: int) -> None:
         self.prompt_tokens = n
@@ -398,7 +416,8 @@ class Spinner:
             parts.append(dim(_human(self.prompt_tokens)))
         if self.cache_hit_tokens is not None and self.cache_miss_tokens is not None:
             parts.append(dim(f"{_human(self.cache_hit_tokens)}/{_human(self.cache_miss_tokens)}"))
-        parts.append(dim(self._label))
+        label = (self._glyph + " " + self._label) if self._glyph else self._label
+        parts.append(dim(label))
         extra_fn = self.extra
         if extra_fn:
             parts.append(dim(extra_fn()))
@@ -416,6 +435,9 @@ class Spinner:
     def _render(self) -> None:
         with self._lock:
             label = self._label
+            glyph = self._glyph
+        if glyph:
+            label = glyph + " " + label
         extra_fn = self.extra
         extra = extra_fn() if extra_fn else ""
         state_fn = self.input_state
@@ -847,14 +869,29 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     typeahead.start(spinner)  # attach dock hooks first so no frame paints inline
     state.last_head = ""             # clear the idle ghost
     spinner.start("calling api")
+    spinner.set("calling api", PHASE_CALL)
     start_prompt_tokens = session.usage["prompt_tokens"]  # snapshot for accumulator
     start_hit = session.usage["prompt_cache_hit_tokens"]
     start_miss = session.usage["prompt_cache_miss_tokens"]
     p = pricing_for(session.model)
     final_text = ""
     reasoning_line_buf = ""       # partial line accumulator for streamed reasoning
+    reasoning_lines = 0           # completed reasoning lines this turn
+    reasoning_open = False        # the "thinking" rule has been printed
+    reasoning_t0 = 0.0            # when reasoning started, for the close rule
     error: Optional[str] = None
     interrupted = False
+
+    def _close_thinking() -> None:
+        """Print the closing rule once, when reasoning gives way to output."""
+        nonlocal reasoning_open
+        if not reasoning_open:
+            return
+        reasoning_open = False
+        took = time.monotonic() - reasoning_t0
+        rule = gray(f"  ╰ thought for {took:.0f}s · {reasoning_lines} lines")
+        spinner.println(rule)
+        session.log("meta", rule)
 
     try:
         while True:
@@ -862,20 +899,32 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             out_tok = 0
 
             def on_reasoning(t: str) -> None:
-                nonlocal reasoning_line_buf
-                spinner.set("reasoning")
+                nonlocal reasoning_line_buf, reasoning_lines
+                nonlocal reasoning_open, reasoning_t0
+                if not reasoning_open:
+                    reasoning_open = True
+                    reasoning_t0 = time.monotonic()
+                    reasoning_lines = 0
+                    head = gray("  ╭ thinking")
+                    spinner.println(head)
+                    session.log("meta", head)
+                spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
                 reasoning_line_buf += t
                 while "\n" in reasoning_line_buf:
                     line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
-                    ln = gray("  " + line.rstrip("\r"))
+                    reasoning_lines += 1
+                    ln = gray("  │ " + line.rstrip("\r"))
                     spinner.println(ln)
                     session.log("meta", ln)
+                    spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
 
             def on_text(t: str, _b: list = buf) -> None:
                 nonlocal out_tok
+                if not _b:
+                    _close_thinking()  # first answer token ends the thinking block
                 _b.append(t)
                 out_tok += 1
-                spinner.set(f"writing {out_tok} tok")
+                spinner.set(f"writing {out_tok} tok", PHASE_WRITE)
 
             try:
                 result: ChatResult = client.stream_chat(
@@ -901,10 +950,13 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
 
             # Flush any partial reasoning line left in the buffer.
             if reasoning_line_buf:
-                ln = gray("  " + reasoning_line_buf.rstrip("\r"))
+                reasoning_lines += 1
+                ln = gray("  │ " + reasoning_line_buf.rstrip("\r"))
                 spinner.println(ln)
                 session.log("meta", ln)
                 reasoning_line_buf = ""
+
+            _close_thinking()  # tools or the final answer end the thinking block
 
             tool_calls = result.message.get("tool_calls")
             if not tool_calls:
@@ -914,7 +966,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             for tc in tool_calls:
                 fn = tc["function"]
                 label = _tool_label(fn)
-                spinner.set(label)
+                spinner.set(label, PHASE_TOOL)
                 # …and, for mutating tools, the diff/preview via the confirm gate
                 out = execute(fn["name"], fn["arguments"],
                               confirm=_make_confirm(spinner, state, typeahead))
@@ -1199,6 +1251,9 @@ def cmd_connect(state: State, args: str) -> None:
     label = PROVIDER_LABELS.get(provider, provider)
     print(bold(f"Connect to {label}"))
 
+    # Use the stored key for this provider (if any)
+    cfg.api_key = cfg.api_keys.get(provider) or cfg.api_key
+
     # 1. api key
     have = "set" if cfg.api_key else "unset"
     key = getpass.getpass(f"  api key (currently {have}, blank = keep): ").strip()
@@ -1265,14 +1320,45 @@ def cmd_memory(state: State, args: str) -> None:
 
 def cmd_model(state: State, args: str) -> None:
     from hrns.config import PRICING
-    if not args.strip():
-        print(f"Current model (new sessions): {bold(state.cfg.model)}")
-        print(f"This session's model: {bold(state.session.model)}")
-        print(dim("Known: " + ", ".join(PRICING.keys())))
+    if args.strip():
+        state.cfg.model = args.strip()
+        state.cfg.save()
+        print(green(f"Default model set to {state.cfg.model}. Use /new to start a session on it."))
         return
-    state.cfg.model = args.strip()
-    state.cfg.save()
-    print(green(f"Default model set to {state.cfg.model}. Use /new to start a session on it."))
+
+    print(f"Current model (new sessions): {bold(state.cfg.model)}")
+    print(f"This session's model: {bold(state.session.model)}")
+
+    # Try to fetch the real model list from the API
+    client = state.client
+    if client is None and state.cfg.api_key:
+        try:
+            client = DeepSeekClient(state.cfg.api_key, state.cfg.base_url, state.cfg.provider)
+        except DeepSeekError:
+            client = None
+
+    models: list[str] = []
+    if client:
+        try:
+            models = client.list_models()
+        except DeepSeekError:
+            pass
+
+    if models and _raw_capable():
+        if state.cfg.model in models:
+            models = [models.pop(models.index(state.cfg.model))] + models
+        label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
+        chosen = pick_from_list(models, f"Select model ({label})")
+        if chosen:
+            state.cfg.model = chosen
+            state.cfg.save()
+            print(green(f"Model set to {chosen}. Use /new to start a session on it."))
+        else:
+            print(yellow("Selection cancelled."))
+    else:
+        print(dim("Known: " + ", ".join(PRICING.keys())))
+        if not client:
+            print(dim("Run /connect to fetch the full model list from the API."))
 
 
 def cmd_mode(state: State, args: str) -> None:
@@ -1490,13 +1576,15 @@ def statusline(state: State) -> str:
     if untracked:
         gparts.append(yellow(f"?{untracked}"))
 
+    provider_label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
     segs = [
         dim(repo),                                                           # repo
         blue(branch),                                                        # branch
         " ".join(gparts),                                                    # git stats
+        bold(provider_label),                                                # provider
         cyan(_model_name(s.model)),                                          # model
         green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),    # cache hit rate
-        _cache_age(s),                                                       # cache freshness
+        _cache_age(s, state.cfg.provider),                                                       # cache freshness
         yellow(_money(cost)),                                                # session cost
         yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
         magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
