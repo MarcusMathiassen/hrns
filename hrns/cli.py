@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover
 
 from hrns import __version__, memory
 from hrns.client import ChatResult, DeepSeekClient, DeepSeekError
-from hrns.config import Config, context_window, pricing_for
+from hrns.config import Config, PROVIDER_LABELS, Provider, context_window, pricing_for
 from hrns.session import Session, list_sessions
 from hrns.tools import (
     TOOL_SCHEMAS,
@@ -1178,9 +1178,13 @@ def cmd_clear(state: State, args: str) -> None:
 
 def cmd_connect(state: State, args: str) -> None:
     cfg = state.cfg
+
+    # Allow "/connect openrouter" or "/connect deepseek" to switch providers
+    if args.strip() in PROVIDER_LABELS:
+        cfg.provider = args.strip()
+
     provider = cfg.provider
-    labels = {"deepseek": "DeepSeek", "openrouter": "OpenRouter"}
-    label = labels.get(provider, cfg.base_url)
+    label = PROVIDER_LABELS.get(provider, provider)
     print(bold(f"Connect to {label}"))
 
     # 1. api key
@@ -1220,7 +1224,7 @@ def cmd_connect(state: State, args: str) -> None:
     here = green("available") if cfg.model in models else yellow("not in /models list")
     print(f"{ok} · {len(models)} models · '{cfg.model}' {here}")
     print(dim(f"  saved to {cfg.config_path} — hrns will reconnect automatically next run"))
-    print(dim(f"  to switch provider set HRNS_BASE_URL or base_url in {cfg.config_path}"))
+    print(dim(f"  to switch provider: /connect openrouter  or  export HRNS_PROVIDER=openrouter"))
 
 
 def cmd_memory(state: State, args: str) -> None:

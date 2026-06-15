@@ -17,7 +17,6 @@ from pathlib import Path
 
 from hrns import storage
 
-DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 
 # Per-1M-token pricing in USD.
@@ -69,16 +68,20 @@ def context_window(model: str) -> int:
     return CONTEXT_WINDOW.get(model, DEFAULT_CONTEXT_WINDOW)
 
 
-# --- provider detection --------------------------------------------------
+# --- providers ----------------------------------------------------------
 Provider = str  # "deepseek" | "openrouter"
 
+PROVIDER_BASE_URLS: dict[Provider, str] = {
+    "deepseek":   "https://api.deepseek.com",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
 
-def detect_provider(base_url: str) -> Provider:
-    """Return the provider key for a base_url."""
-    if "openrouter.ai" in base_url:
-        return "openrouter"
-    return "deepseek"
+PROVIDER_LABELS: dict[Provider, str] = {
+    "deepseek":   "DeepSeek",
+    "openrouter": "OpenRouter",
+}
 
+DEFAULT_PROVIDER: Provider = "deepseek"
 
 # Provider→env var name for the API key.  The saved key is shared across
 # providers (one key in ~/.hrns/config.json), but env-var lookups are
@@ -107,17 +110,17 @@ def _load_dotenv(path: Path) -> dict[str, str]:
 @dataclass
 class Config:
     api_key: str | None = None
-    base_url: str = DEFAULT_BASE_URL
+    provider: Provider = DEFAULT_PROVIDER
     model: str = DEFAULT_MODEL
     temperature: float = 0.3
     approval_mode: str = "confirm"
     balance: float | None = None  # cached from balance endpoint
     home: Path = field(default_factory=lambda: Path(os.environ.get("HRNS_HOME", Path.home() / ".hrns")))
 
-    # --- derived paths -------------------------------------------------
+    # --- derived --------------------------------------------------------
     @property
-    def provider(self) -> Provider:
-        return detect_provider(self.base_url)
+    def base_url(self) -> str:
+        return PROVIDER_BASE_URLS.get(self.provider, PROVIDER_BASE_URLS[DEFAULT_PROVIDER])
 
     @property
     def sessions_dir(self) -> Path:
@@ -138,9 +141,9 @@ class Config:
         saved = storage.read_json(home / "config.json", default={}) or {}
 
         cfg = cls(home=home)
-        cfg.base_url = (
-            os.environ.get("HRNS_BASE_URL")          # env override
-            or saved.get("base_url", cfg.base_url)
+        cfg.provider = (
+            os.environ.get("HRNS_PROVIDER")          # env override
+            or saved.get("provider", cfg.provider)
         )
         cfg.model = saved.get("model", cfg.model)
         cfg.temperature = saved.get("temperature", cfg.temperature)
@@ -166,7 +169,7 @@ class Config:
         """
         data = storage.read_json(self.config_path, default={}) or {}
         data.update({
-            "base_url": self.base_url,
+            "provider": self.provider,
             "model": self.model,
             "temperature": self.temperature,
             "approval_mode": self.approval_mode,
