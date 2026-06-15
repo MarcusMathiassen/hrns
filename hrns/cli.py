@@ -2246,6 +2246,12 @@ class TypeAhead:
             self.queue.clear()
         return dropped
 
+    def pop_queued(self) -> Optional[str]:
+        """Remove and return the next queued prompt, or None if empty.
+        Thread-safe — callable from the main thread without holding the lock."""
+        with self._lock:
+            return self.queue.popleft() if self.queue else None
+
     # --- confirm prompts borrow the keyboard ----------------------------
     def request_line(self, prompt: str) -> str:
         """Synchronously read one line through the reader thread."""
@@ -2508,10 +2514,10 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
             # no dock (pipe / dumb terminal): print the vitals inline instead
             print("\n" + statusline(state))
             print(_divider())
-        from_queue = bool(typeahead.queue)
-        if from_queue:
+        from_queue = typeahead.pop_queued()
+        if from_queue is not None:
             # a prompt queued while the previous turn ran — echo it like input
-            line = typeahead.queue.popleft().strip()
+            line = from_queue.strip()
             print(("\n" if docked else "") + prompt_fn() + _input_display(line) + dim("  (queued)"))
         else:
             try:
