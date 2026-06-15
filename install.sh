@@ -10,7 +10,7 @@ DEST="${HRNS_HOME:-$HOME/.hrns}"
 # ---- check Python ----------------------------------------------------------
 PY=$(command -v python3 || command -v python || echo "")
 if [ -z "$PY" ]; then
-    echo "ERROR: Python not found. Install Python 3.12+ first." >&2
+    echo "ERROR: Python not found. Install Python 3.9+ first." >&2
     exit 1
 fi
 
@@ -18,8 +18,8 @@ PY_VER=$("$PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_inf
 MAJOR=$(echo "$PY_VER" | cut -d. -f1)
 MINOR=$(echo "$PY_VER" | cut -d. -f2)
 
-if [ "$MAJOR" -lt 3 ] || [ "$MAJOR" -eq 3 -a "$MINOR" -lt 12 ]; then
-    echo "ERROR: Python 3.12+ required (found $PY_VER)." >&2
+if [ "$MAJOR" -lt 3 ] || [ "$MAJOR" -eq 3 -a "$MINOR" -lt 9 ]; then
+    echo "ERROR: Python 3.9+ required (found $PY_VER)." >&2
     exit 1
 fi
 
@@ -47,9 +47,9 @@ SRC="$TMP/hrns-$BRANCH"
 echo "  installing..."
 cd "$SRC"
 if [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
-    "$PY" -m pip install -e . >/dev/null
+    "$PY" -m pip install .
 else
-    "$PY" -m pip install --user -e . >/dev/null
+    "$PY" -m pip install --user .
 fi
 
 # ---- done ------------------------------------------------------------------
