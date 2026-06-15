@@ -46,11 +46,20 @@ SRC="$TMP/hrns-$BRANCH"
 # ---- install ---------------------------------------------------------------
 echo "  installing..."
 cd "$SRC"
+
+# Build pip args: prefer venv, fall back to --user, skip --user for root
+PIP_ARGS=""
 if [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
-    "$PY" -m pip install .
+    PIP_ARGS=""
+elif [ "$(id -u)" -eq 0 ]; then
+    PIP_ARGS=""
 else
-    "$PY" -m pip install --user .
+    PIP_ARGS="--user"
 fi
+
+# PEP 668: try with --break-system-packages first; fall back if pip is older
+"$PY" -m pip install $PIP_ARGS --break-system-packages . || \
+"$PY" -m pip install $PIP_ARGS .
 
 # ---- done ------------------------------------------------------------------
 echo ""
