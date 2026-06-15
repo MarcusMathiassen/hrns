@@ -1551,14 +1551,23 @@ def pick_from_list(items: list[str], title: str = "Select") -> str | None:
     """Interactive list picker — arrow keys, enter to select, esc to cancel.
 
     Renders directly into the terminal, restores the cursor position on exit.
-    Returns the selected item or None on cancel. Requires raw-mode terminal."""
+    Returns the selected item or None on cancel. Requires a TTY."""
     n = len(items)
     if n == 0:
         return None
+    if not _raw_capable():
+        return None
+
     idx = 0
     query = ""         # filter buffer
     filtered = items   # items matching the query
     keys = _keys()
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+
+    # Drain any stale keystrokes buffered from the previous read_line
+    while keys.getch(0):
+        pass
 
     # Find terminal height so we know how many items to show
     size = shutil.get_terminal_size()
@@ -1598,6 +1607,7 @@ def pick_from_list(items: list[str], title: str = "Select") -> str | None:
     sys.stdout.write("\0337")   # DECSC — save cursor
     _draw()
     try:
+        tty.setraw(fd)
         while True:
             ch = keys.getch(10)
             if ch == "":
@@ -1634,6 +1644,7 @@ def pick_from_list(items: list[str], title: str = "Select") -> str | None:
             sys.stdout.write(f"\033[{visible_lines}A")
             _draw()
     finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         # Restore cursor and clear picker area
         sys.stdout.write("\0338")        # DECRC — restore cursor
         # Clear the lines we drew (they're above the restored cursor)
