@@ -897,7 +897,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     error: Optional[str] = None
     interrupted = False
     # collapsed: reasoning rolls live on the status row; full: each reasoning
-    # line is printed into scrollback with a │ prefix.  Either way the complete
+    # line is printed into scrollback in gray.  Either way the complete
     # stream is kept in the transcript via session.log.
     collapsed = cfg.reasoning_display != "full"
 
@@ -923,13 +923,13 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
             line = line.rstrip("\r")
             reasoning_lines += 1
-            session.log("meta", gray("  │ " + line))
+            session.log("meta", gray("  " + line))
             if collapsed:
                 stripped = line.strip()
                 if stripped:
                     spinner.set_tail(stripped)    # live preview, ephemeral
             else:
-                spinner.println(gray("  │ " + line))
+                spinner.println(gray("  " + line))
             spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
         if collapsed and reasoning_line_buf:
             stripped = reasoning_line_buf.strip()
@@ -974,7 +974,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             # Flush any partial reasoning line left in the buffer.
             if reasoning_line_buf:
                 reasoning_lines += 1
-                ln = gray("  │ " + reasoning_line_buf.rstrip("\r"))
+                ln = gray("  " + reasoning_line_buf.rstrip("\r"))
                 session.log("meta", ln)
                 if collapsed:
                     stripped = reasoning_line_buf.strip()
