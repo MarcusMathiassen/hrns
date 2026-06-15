@@ -1640,12 +1640,10 @@ def statusline(state: State) -> str:
     provider_label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
     segs = [
         # --- where -------------------------------------------------
-        dim(repo),
-        blue(branch),
+        dim(repo) + "/ " + blue(f"({branch})") if branch else dim(repo),
         " ".join(gparts),
         # --- what -------------------------------------------------
-        bold(provider_label),
-        cyan(_model_name(s.model)),
+        bold(provider_label) + "/" + cyan(_model_name(s.model)),
         # --- cache ------------------------------------------------
         green(f"{cache_rate:.1f}%" if cache_rate is not None else "--%"),
         _cache_age(s, state.cfg.provider),
