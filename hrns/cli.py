@@ -1469,6 +1469,7 @@ def statusline(state: State) -> str:
         yellow(_money(cost)),                                                # session cost
         yellow(f"${bal:.2f}" if bal is not None else "--"),                  # balance
         magenta(f"{_human(s.context_tokens)} ctx / {_human(cum_tok)} cum"),  # context / total
+        dim(f"v{__version__}"),                                                  # version
     ]
     # context window usage %
     cw = context_window(s.model)
