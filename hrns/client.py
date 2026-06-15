@@ -1,8 +1,9 @@
-"""A tiny, dependency-free DeepSeek client (OpenAI-compatible wire format).
+"""A tiny, dependency-free chat-completions client (OpenAI-compatible wire format).
 
 Endpoints used:
     GET  /models           -> connectivity / auth check (used by `/connect`)
-    GET  /user/balance     -> account balance (shown in status line)
+    GET  /user/balance     -> DeepSeek account balance
+    GET  /api/v1/auth/key  -> OpenRouter credit balance
     POST /chat/completions -> streamed chat, with usage.include for cache stats
 
 We stream so the user sees tokens as they arrive, and we set
@@ -18,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from hrns.config import Provider
+
 
 class DeepSeekError(Exception):
     pass
@@ -31,19 +34,24 @@ class ChatResult:
 
 
 class DeepSeekClient:
-    def __init__(self, api_key: str, base_url: str, timeout: float = 300.0):
+    def __init__(self, api_key: str, base_url: str, provider: Provider, timeout: float = 300.0):
         if not api_key:
             raise DeepSeekError("No API key. Run /connect first.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.provider = provider
         self.timeout = timeout
 
     def _headers(self) -> dict[str, str]:
-        return {
+        h = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if self.provider == "openrouter":
+            h["HTTP-Referer"] = "https://github.com/MarcusMathiassen/hrns"
+            h["X-Title"] = "hrns"
+        return h
 
     def list_models(self) -> list[str]:
         req = urllib.request.Request(f"{self.base_url}/models", headers=self._headers(), method="GET")
@@ -58,6 +66,19 @@ class DeepSeekClient:
 
     def get_balance(self) -> float | None:
         """Return the account balance in USD, or None on failure."""
+        if self.provider == "openrouter":
+            # OpenRouter uses /api/v1/auth/key — returns { data: { credits: ... } }
+            req = urllib.request.Request(
+                f"{self.base_url}/auth/key", headers=self._headers(), method="GET"
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return float(data.get("data", {}).get("credits", 0))
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+                return None
+
+        # DeepSeek
         req = urllib.request.Request(
             f"{self.base_url}/user/balance", headers=self._headers(), method="GET"
         )
@@ -87,11 +108,13 @@ class DeepSeekClient:
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "prefix": True,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if thinking is not None:
+        # DeepSeek-specific params — harmless if ignored by other providers
+        if self.provider == "deepseek":
+            payload["prefix"] = True
+        if thinking is not None and self.provider == "deepseek":
             payload["thinking"] = thinking
             payload["reasoning_effort"] = reasoning_effort
         else:
@@ -120,7 +143,7 @@ class DeepSeekClient:
             if code == 401:
                 hint = "Bad API key — run /connect to set your key"
             elif code == 402:
-                hint = "Insufficient balance — top up at https://platform.deepseek.com"
+                hint = "Insufficient balance — top up your account"
             elif code == 429:
                 hint = "Rate limited — slow down and retry"
             elif code == 400:
@@ -128,7 +151,7 @@ class DeepSeekClient:
             elif code == 422:
                 hint = f"Invalid parameters: {body}"
             elif code in (500, 503):
-                hint = "DeepSeek server error — retry in a moment"
+                hint = "Server error — retry in a moment"
             else:
                 hint = body
             raise DeepSeekError(f"HTTP {code}: {hint}") from e

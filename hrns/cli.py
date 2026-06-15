@@ -883,7 +883,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                     messages=session.messages,
                     tools=TOOL_SCHEMAS,
                     temperature=cfg.temperature,
-                    thinking={"type": "enabled"},
+                    thinking={"type": "enabled"} if cfg.provider == "deepseek" else None,
                     on_text=on_text,
                     on_reasoning=on_reasoning,
                 )
@@ -1128,7 +1128,7 @@ def cmd_help(state: State, args: str) -> None:
     for name, desc in [
         ("/sessions", "list saved sessions; /sessions <id|#> to resume one"),
         ("/new", "archive the current session and start a fresh one"),
-        ("/connect", "configure & test the DeepSeek connection (API key, model)"),
+        ("/connect", "configure & test the API connection (key, model, base url)"),
         ("/memory", "view memory; /memory add <text> | rm <id> | clear"),
         ("/model", "show or set the model (applies to new sessions)"),
         ("/mode", "cycle approval: confirm → auto-edit → auto (or Shift+Tab)"),
@@ -1178,7 +1178,10 @@ def cmd_clear(state: State, args: str) -> None:
 
 def cmd_connect(state: State, args: str) -> None:
     cfg = state.cfg
-    print(bold("Connect to DeepSeek"))
+    provider = cfg.provider
+    labels = {"deepseek": "DeepSeek", "openrouter": "OpenRouter"}
+    label = labels.get(provider, "API")
+    print(bold(f"Connect to {label}"))
     print(dim(f"  base_url [{cfg.base_url}]:"), end=" ")
     base = input().strip() or cfg.base_url
     print(dim(f"  model [{cfg.model}]:"), end=" ")
@@ -1194,7 +1197,7 @@ def cmd_connect(state: State, args: str) -> None:
         return
 
     try:
-        client = DeepSeekClient(cfg.api_key, cfg.base_url)
+        client = DeepSeekClient(cfg.api_key, cfg.base_url, cfg.provider)
         models = client.list_models()
     except DeepSeekError as e:
         print(red(f"Connection failed: {e}"))
@@ -2163,7 +2166,7 @@ def _replay_conversation(state: State) -> None:
 
 # --- main loop ---------------------------------------------------------
 def banner(state: State) -> None:
-    print(bold(cyan(f"hrns {__version__}")) + dim(" — DeepSeek coding harness"))
+    print(bold(cyan(f"hrns {__version__}")) + dim(" — coding harness"))
     conn = green("connected") if state.client else red("not connected (run /connect)")
     print(dim(f"  model {state.session.model} · session {state.session.id} · {conn}"))
     if state.session.turn_count() > 0:
@@ -2192,7 +2195,7 @@ def main() -> None:
     client = None
     if cfg.api_key:
         try:
-            client = DeepSeekClient(cfg.api_key, cfg.base_url)
+            client = DeepSeekClient(cfg.api_key, cfg.base_url, cfg.provider)
         except DeepSeekError:
             client = None
     state = State(cfg=cfg, session=session, client=client, approval_mode=cfg.approval_mode)
@@ -2253,7 +2256,7 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
             continue
 
         if state.client is None:
-            print(yellow("Not connected. Run /connect to set your DeepSeek API key."))
+            print(yellow("Not connected. Run /connect to set your API key."))
             continue
 
         echo = prompt_fn() + _input_display(line) + (dim("  (queued)") if from_queue else "")
