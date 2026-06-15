@@ -3,7 +3,7 @@ name = "hrns"
 version = "0.1.0"
 description = "A DeepSeek-focused coding harness built around prefix cache hits"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = []  # standard library only — runs with no pip install
 
 [project.scripts]
