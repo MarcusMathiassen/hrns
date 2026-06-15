@@ -1179,9 +1179,21 @@ def cmd_clear(state: State, args: str) -> None:
 def cmd_connect(state: State, args: str) -> None:
     cfg = state.cfg
 
-    # Allow "/connect openrouter" or "/connect deepseek" to switch providers
+    # Allow "/connect openrouter" or "/connect deepseek" to skip the picker
     if args.strip() in PROVIDER_LABELS:
         cfg.provider = args.strip()
+    elif _raw_capable():
+        labels = list(PROVIDER_LABELS.values())
+        chosen = pick_from_list(labels, "Select provider")
+        if chosen:
+            # map label back to provider key
+            for k, v in PROVIDER_LABELS.items():
+                if v == chosen:
+                    cfg.provider = k
+                    break
+        else:
+            print(yellow("Selection cancelled."))
+            return
 
     provider = cfg.provider
     label = PROVIDER_LABELS.get(provider, provider)
