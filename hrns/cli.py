@@ -1206,7 +1206,7 @@ def _make_confirm(spinner: Spinner, state: State, typeahead: "TypeAhead"):
                 return ans in ("y", "yes")
 
             # in-workspace mutating tools (edit_file / create_file / run_bash / save_memory)
-            if name in ("edit_file", "create_file"):
+            if name in ("edit_file", "create_file", "run_bash"):
                 _say(session, "meta", _confirm_preview(name, args, reason), sp)
             if _auto_approves(state.approval_mode, name, reason):
                 return True
