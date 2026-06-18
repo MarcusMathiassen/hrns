@@ -1143,7 +1143,7 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
         # find the line offset so hunk headers show real file line numbers
         start_line = 1
         try:
-            file_text = Path(path).read_text()
+            file_text = resolve_target(path).read_text()
             idx = file_text.find(old)
             if idx != -1:
                 start_line = file_text[:idx].count("\n") + 1
