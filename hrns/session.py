@@ -1,19 +1,21 @@
 """A Session is an append-only conversation persisted to disk.
 
 WHY THIS SHAPE (the caching strategy):
-DeepSeek's context cache and OpenRouter's response cache are both keyed on the
-*prefix* of the request. A cache hit happens when the leading bytes of
-`messages` are identical to a previous request the platform has already seen.
-So this harness treats the message log as immutable and append-only:
+DeepSeek's context cache, OpenRouter's response cache, and MiMo's upstream
+cache are all keyed on the *prefix* of the request. A cache hit happens when
+the leading bytes of `messages` are identical to a previous request the
+platform has already seen. So this harness treats the message log as immutable
+and append-only:
 
   * messages[0] is a STATIC system prompt — the stable anchor. Memory is
     snapshotted into it at creation time, never mutated afterward, so the
     prefix never shifts under us.
   * Every turn re-sends the full history; the unchanged prefix is served from
-    the provider's cache (DeepSeek on-disk KV, OpenRouter proxy-layer).
+    the provider's cache (DeepSeek on-disk KV, OpenRouter proxy-layer, MiMo
+    upstream).
   * Because the log is persisted byte-for-byte, RESUMING a session days later
     still replays an identical prefix and still hits the cache (within each
-    provider's cache TTL; DeepSeek ~5 min on-disk, OpenRouter varies by
+    provider's cache TTL; DeepSeek ~5 min on-disk, OpenRouter/MiMo varies by
     upstream — both reset the clock when the prefix is re-sent).
   * Volatile data (timestamps, "today is...") is kept OUT of the prefix so it
     never invalidates the cache.

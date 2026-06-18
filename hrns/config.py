@@ -7,7 +7,7 @@ Resolution order for the API key:
     4. PROVIDER_API_KEY in a project-local .env (first-run bootstrap only)
 
 The provider is auto-detected from the base_url — "deepseek" for
-api.deepseek.com, "openrouter" for openrouter.ai.
+api.deepseek.com, "openrouter" for openrouter.ai, "mimo" for api.xiaomimimo.com.
 """
 
 from __future__ import annotations
@@ -38,6 +38,12 @@ PRICING: dict[str, dict[str, float]] = {
     "google/gemini-2.0-flash":         {"cache_hit": 0.08, "cache_miss": 0.08, "output": 0.29},
     "google/gemini-2.5-pro":           {"cache_hit": 1.38, "cache_miss": 1.38, "output": 5.50},
     "meta-llama/llama-4-maverick":     {"cache_hit": 0.17, "cache_miss": 0.17, "output": 0.76},
+    # MiMo  (cache_hit = input_cache_read, cache_miss = prompt, output = completion)
+    "mimo-v2.5":       {"cache_hit": 0.0028,  "cache_miss": 0.14,  "output": 0.28},
+    "mimo-v2.5-pro":   {"cache_hit": 0.0036,  "cache_miss": 0.435, "output": 0.87},
+    "mimo-v2-flash":   {"cache_hit": 0.01,    "cache_miss": 0.10,  "output": 0.30},
+    "mimo-v2-pro":     {"cache_hit": 0.20,    "cache_miss": 1.00,  "output": 3.00},
+    "mimo-v2-omni":    {"cache_hit": 0.08,    "cache_miss": 0.40,  "output": 2.00},
 }
 
 
@@ -62,6 +68,11 @@ CONTEXT_WINDOW: dict[str, int] = {
     "google/gemini-2.0-flash":     1_000_000,
     "google/gemini-2.5-pro":       1_000_000,
     "meta-llama/llama-4-maverick": 1_000_000,
+    "mimo-v2.5":             1_048_576,
+    "mimo-v2.5-pro":         1_048_576,
+    "mimo-v2-flash":           262_144,
+    "mimo-v2-pro":           1_048_576,
+    "mimo-v2-omni":            262_144,
 }
 
 
@@ -70,16 +81,18 @@ def context_window(model: str) -> int:
 
 
 # --- providers ----------------------------------------------------------
-Provider = str  # "deepseek" | "openrouter"
+Provider = str  # "deepseek" | "openrouter" | "mimo"
 
 PROVIDER_BASE_URLS: dict[Provider, str] = {
     "deepseek":   "https://api.deepseek.com",
     "openrouter": "https://openrouter.ai/api/v1",
+    "mimo":       "https://api.xiaomimimo.com/v1",
 }
 
 PROVIDER_LABELS: dict[Provider, str] = {
     "deepseek":   "DeepSeek",
     "openrouter": "OpenRouter",
+    "mimo":       "MiMo",
 }
 
 DEFAULT_PROVIDER: Provider = "deepseek"
@@ -90,6 +103,7 @@ DEFAULT_PROVIDER: Provider = "deepseek"
 _PROVIDER_API_KEY_ENV: dict[Provider, str] = {
     "deepseek":   "DEEPSEEK_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "mimo":       "MIMO_API_KEY",
 }
 
 

@@ -99,6 +99,7 @@ def _money(c: float) -> str:
 _CACHE_TTL: dict[str, int] = {
     "deepseek":   300,  # on-disk KV cache
     "openrouter": 300,  # proxy-layer response cache (varies by upstream)
+    "mimo":       300,  # upstream cache (varies by model)
 }
 
 
@@ -1336,6 +1337,7 @@ def cmd_connect(state: State, args: str) -> None:
     print(f"{ok} · {len(models)} models · '{cfg.model}' {here}")
     print(dim(f"  saved to {cfg.config_path} — hrns will reconnect automatically next run"))
     print(dim(f"  to switch provider: /connect openrouter  or  export HRNS_PROVIDER=openrouter"))
+    print(dim(f"                        /connect mimo        or  export HRNS_PROVIDER=mimo"))
 
 
 def cmd_memory(state: State, args: str) -> None:
@@ -1556,6 +1558,11 @@ _MODEL_DISPLAY = {
     "deepseek-reasoner": "reasoner",
     "deepseek-v4-flash": "v4 flash",
     "deepseek-v4-pro": "v4 pro",
+    "mimo-v2.5": "v2.5",
+    "mimo-v2.5-pro": "v2.5 pro",
+    "mimo-v2-flash": "v2 flash",
+    "mimo-v2-pro": "v2 pro",
+    "mimo-v2-omni": "v2 omni",
 }
 
 

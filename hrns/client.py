@@ -66,8 +66,8 @@ class DeepSeekClient:
 
     def get_balance(self) -> float | None:
         """Return the account balance in USD, or None on failure."""
-        if self.provider == "openrouter":
-            # OpenRouter uses /api/v1/auth/key — returns { data: { credits: ... } }
+        if self.provider in ("openrouter", "mimo"):
+            # OpenRouter & MiMo use /auth/key — returns { data: { credits: ... } }
             req = urllib.request.Request(
                 f"{self.base_url}/auth/key", headers=self._headers(), method="GET"
             )
