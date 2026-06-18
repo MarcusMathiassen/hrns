@@ -273,11 +273,14 @@ def _confirm_body(prompt: str, text: str, cursor: int, cols: int) -> str:
 
 def _paint_input_box(parts: list[str], head: str, text: str, cursor: int,
                      *, prompt: str = "", block_cursor: bool = False,
-                     foot: str = "") -> int:
+                     foot: str = "", extra_rows: int = 0) -> int:
     """Draw the bottom input dock — `head` on the top border, the field body,
     then `foot` on the bottom border — growing the dock to fit. Returns the
     terminal row count, or 0 when the terminal is too short (caller falls back
     to an inline prompt).
+
+    `extra_rows` reserves additional rows between the input field and the
+    bottom border (used by the inline command picker).
 
     Without `prompt` the body is `text` wrapped across as many input rows as it
     needs, so a multi-line or pasted draft shows in full. With `prompt` (a
@@ -295,7 +298,7 @@ def _paint_input_box(parts: list[str], head: str, text: str, cursor: int,
     else:
         width = max(8, cols - 2)              # the "│ " mid-row prefix is 2 cols
         rows, cur_row, cur_col = _layout(text, cursor, width)
-        if len(rows) == 1 and cursor == len(text):   # faded /command preview
+        if len(rows) == 1 and cursor == len(text) and extra_rows == 0:
             ghost = _command_ghost(text)[:max(0, width - len(rows[0]))]
 
     max_in = max(1, lines - 7)                # most input rows the dock can show
@@ -303,7 +306,7 @@ def _paint_input_box(parts: list[str], head: str, text: str, cursor: int,
         start = min(max(0, cur_row - max_in + 1), len(rows) - max_in)
         rows, cur_row = rows[start:start + max_in], cur_row - start
 
-    rows_n = _dock_ensure(parts, len(rows) + 2)
+    rows_n = _dock_ensure(parts, len(rows) + 2 + extra_rows)
     if rows_n == 0:
         return 0
     if len(rows) > _Dock.height - 2:          # dock capped tighter than asked
@@ -612,6 +615,7 @@ working inside the user's project in the current working directory.
 - edit_file — change a file via an exact, unique string replacement.
 - create_file — add a new file.
 - run_bash — run builds, tests, git, and other shell commands. Always preface the command with a one-liner explaining why it needs to run (e.g. "check the build passes" or "verify no regressions").
+- save_todo — manage a session-scoped todo list for tracking your work plan. Use 'add', 'done', 'list', 'clear' actions. Break down complex tasks into steps so the user can see your progress.
 - save_memory — save a persistent fact or preference for future sessions (applies to new sessions only, never the current one).
 
 # How to work
@@ -627,6 +631,8 @@ working inside the user's project in the current working directory.
   with run_bash and fix anything you broke before declaring done.
 - edit_file, create_file, and run_bash require user confirmation. If the user
   declines a step, stop and ask rather than working around it.
+- For multi-step tasks, use save_todo to create a task list before starting, and
+  update it as you complete each step. This helps the user track your progress.
 
 # Safety
 - Some actions are destructive or hard to undo. Do NOT run them unless the user
@@ -654,6 +660,10 @@ working inside the user's project in the current working directory.
 - Be concise and direct. Briefly say why before a tool call, not after.
 - Reply in GitHub-flavored markdown. Reference code as `path:line`.
 - When you finish, give a short summary of what changed — not a play-by-play.
+- When your response naturally leads to a next action (e.g. you asked a question,
+  finished a task and the user might want to commit, or there's an obvious follow-up),
+  end with a line: `<!-- suggest: the suggested prompt text -->`. Keep it short
+  (one sentence). Only suggest when there's a clear, high-confidence next step.
 
 # Memory
 - You have a `save_memory` tool for persistent cross-session memory. Use it to
@@ -692,6 +702,10 @@ class State:
     approved_dirs: set[Path] = field(default_factory=set)
     # the last turn's top-border stats, shown dimmed when idle
     last_head: str = ""
+    # suggested next prompt from the assistant's response (parsed from <!-- suggest: ... -->)
+    suggestion: str = ""
+    # typeahead reader — set in main(), used by pick_from_list to pause/resume
+    typeahead: Any = None
 
 
 # --- approval modes (cycled with Shift+Tab) ---------------------------
@@ -726,6 +740,9 @@ def _auto_approves(mode: str, name: str, reason: Optional[str]) -> bool:
     # save_memory only writes to the memory file — never destructive
     if name == "save_memory":
         return True
+    # save_todo only writes to the session's todo list — never destructive
+    if name == "save_todo":
+        return True
     if mode == "auto-edit":
         return name in ("edit_file", "create_file")
     if mode == "auto":
@@ -755,6 +772,20 @@ def _api_stats(model: str, usage: dict, elapsed: float) -> str:
     out = int(usage.get("completion_tokens", 0) or 0)
     cost = hit / 1e6 * p["cache_hit"] + miss / 1e6 * p["cache_miss"] + out / 1e6 * p["output"]
     return dim(f"  in {_human(hit + miss)} · out {_human(out)} · ${cost:.6f} · {elapsed:.0f}s")
+
+
+_SUGGEST_RE = re.compile(r"<!--\s*suggest:\s*(.*?)\s*-->")
+
+
+def _extract_suggestion(text: str) -> tuple[str, str]:
+    """Extract a `<!-- suggest: ... -->` comment from the response.
+    Returns (cleaned_text, suggestion). Suggestion is empty if not found."""
+    m = _SUGGEST_RE.search(text)
+    if not m:
+        return text, ""
+    suggestion = m.group(1).strip()
+    cleaned = text[:m.start()].rstrip()
+    return cleaned, suggestion
 
 
 def render_assistant(md: str) -> str:
@@ -894,6 +925,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     final_text = ""
     reasoning_line_buf = ""       # partial line accumulator for streamed reasoning
     reasoning_lines = 0           # completed reasoning lines this turn
+    reasoning_t0 = 0.0            # when reasoning started (for duration display)
     reasoning_open = False        # reasoning stream is in progress
     error: Optional[str] = None
     interrupted = False
@@ -903,22 +935,31 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     collapsed = cfg.reasoning_display != "full"
 
     def _close_thinking() -> None:
-        """End the reasoning block: clear ephemeral state and, in collapsed
-        mode, drop the live tail so the spinner row returns to normal."""
+        """End the reasoning block: emit a dimmed summary into scrollback and
+        clear ephemeral spinner state so the status row returns to normal."""
         nonlocal reasoning_open
         if not reasoning_open:
             return
         reasoning_open = False
         if collapsed:
             spinner.set_tail("")
+            elapsed = time.monotonic() - reasoning_t0
+            header = dim(f"  ✻ reasoning · {reasoning_lines} lines · {elapsed:.1f}s")
+            spinner.println(header)
+            session.log("meta", header)
 
     def _on_reasoning(t: str) -> None:
         nonlocal reasoning_line_buf, reasoning_lines
-        nonlocal reasoning_open
+        nonlocal reasoning_open, reasoning_t0
         if not reasoning_open:
             reasoning_open = True
             reasoning_lines = 0
-        spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
+            reasoning_t0 = time.monotonic()
+            if collapsed:
+                spinner.println(dim("  ✻ reasoning…"))
+                session.log("meta", dim("  ✻ reasoning…"))
+        elapsed = time.monotonic() - reasoning_t0
+        spinner.set(f"reasoning · {reasoning_lines} lines · {elapsed:.0f}s", PHASE_REASON)
         reasoning_line_buf += t
         while "\n" in reasoning_line_buf:
             line, reasoning_line_buf = reasoning_line_buf.split("\n", 1)
@@ -929,9 +970,10 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                 stripped = line.strip()
                 if stripped:
                     spinner.set_tail(stripped)    # live preview, ephemeral
+                spinner.println(gray("  " + line))  # persist to scrollback
             else:
                 spinner.println(gray("  " + line))
-            spinner.set(f"reasoning · {reasoning_lines} lines", PHASE_REASON)
+            spinner.set(f"reasoning · {reasoning_lines} lines · {elapsed:.0f}s", PHASE_REASON)
         if collapsed and reasoning_line_buf:
             stripped = reasoning_line_buf.strip()
             if stripped:
@@ -975,12 +1017,14 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
             # Flush any partial reasoning line left in the buffer.
             if reasoning_line_buf:
                 reasoning_lines += 1
-                ln = gray("  " + reasoning_line_buf.rstrip("\r"))
+                raw = reasoning_line_buf.rstrip("\r")
+                ln = gray("  " + raw)
                 session.log("meta", ln)
                 if collapsed:
                     stripped = reasoning_line_buf.strip()
                     if stripped:
                         spinner.set_tail(stripped)
+                    spinner.println(ln)  # persist to scrollback
                 else:
                     spinner.println(ln)
                 reasoning_line_buf = ""
@@ -997,8 +1041,10 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                 label = _tool_label(fn)
                 spinner.set(label, PHASE_TOOL)
                 # …and, for mutating tools, the diff/preview via the confirm gate
+                tool_t0 = time.monotonic()
                 out = execute(fn["name"], fn["arguments"],
                               confirm=_make_confirm(spinner, state, typeahead))
+                tool_elapsed = time.monotonic() - tool_t0
                 if fn["name"] == "save_memory":
                     try:
                         mem_text = json.loads(fn.get("arguments", "{}")).get("text", "")[:80]
@@ -1006,6 +1052,19 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                         mem_text = ""
                     if mem_text:
                         _say(session, "meta", green("  ✓ ") + mem_text, spinner)
+                elif fn["name"] == "save_todo":
+                    pending = len(session.pending_todos)
+                    total = len(session.todos)
+                    _say(session, "meta", dim(f"  {PHASE_TOOL} todo") + dim(f" ({pending}/{total} pending)"), spinner)
+                else:
+                    summary = _tool_summary(fn["name"], out)
+                    timing = dim(f"{tool_elapsed:.1f}s")
+                    line = dim(f"  {PHASE_TOOL} {label}")
+                    if summary:
+                        line += dim(f" ({summary}, {timing})")
+                    else:
+                        line += dim(f" ({timing})")
+                    _say(session, "meta", line, spinner)
                 session.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
             # loop so the model can read the tool results
     except KeyboardInterrupt:
@@ -1026,6 +1085,10 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
         state.last_head = spinner.last_head()  # freeze for the idle prompt
         spinner.stop()    # before the hooks detach, so no frame paints inline
         typeahead.set_hooks(None)  # return dock to idle mode
+        # pre-fill the input with the assistant's suggested next prompt, if any
+        if state.suggestion:
+            typeahead._editor.set_text(state.suggestion)
+            state.suggestion = ""
 
     if interrupted:
         _repair_dangling_tool_calls(session)
@@ -1041,6 +1104,8 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
         session.save(cfg.sessions_dir)
         return
 
+    final_text, suggestion = _extract_suggestion(final_text)
+    state.suggestion = suggestion
     _say(session, "assistant", "\n" + render_assistant(final_text))
     session.save(cfg.sessions_dir)
     # refresh balance after spending
@@ -1070,7 +1135,30 @@ def _tool_label(fn: dict) -> str:
         "create_file": f"create {base('path')}",
         "run_bash": f"run {_short(str(args.get('command', '')), 40)}",
         "save_memory": "saving a memory",
+        "save_todo": "updating todo list",
     }.get(name, name)
+
+
+def _tool_summary(name: str, out: str) -> str:
+    """Compact metric extracted from a tool's output string."""
+    if name == "read_file":
+        return f"{len(out.splitlines())} lines"
+    if name == "list_dir":
+        return f"{len(out.splitlines())} entries"
+    if name in ("glob", "grep"):
+        n = len([l for l in out.splitlines() if l.strip()])
+        return f"{n} match{'es' if n != 1 else ''}"
+    if name == "edit_file":
+        m = re.match(r"Edited .+?\((\d+) replacement", out)
+        return f"{m.group(1)} replacement{'s' if m.group(1) != '1' else ''}" if m else ""
+    if name == "run_bash":
+        m = re.match(r"\[exit (\d+)\]", out)
+        code = int(m.group(1)) if m else -1
+        n = len(out.splitlines())
+        return dim(f"exit {code}") + f" · {n} lines"
+    if name == "create_file":
+        return f"{len(out.splitlines())} lines"
+    return ""
 
 
 def _diff_preview(old: str, new: str, start_line: int = 1) -> list[str]:
@@ -1161,6 +1249,8 @@ def _confirm_preview(name: str, args: dict, reason: Optional[str] = None) -> str
         return dim(f"  {yellow('run')} {bold(str(args.get('command', '')))}")
     if name == "save_memory":
         return dim(f"  {magenta('memory')} {(args.get('text', '') or '')[:100]}")
+    if name == "save_todo":
+        return dim(f"  {magenta('todo')} {args.get('action', '?')} {(args.get('text', '') or '')[:80]}")
     if name in ("read_file",):
         return dim(f"  {blue('read')} {bold(str(args.get('path', '?')))}")
     return dim(f"  {blue(name)} {dim(str(args))}")
@@ -1230,6 +1320,7 @@ def cmd_help(state: State, args: str) -> None:
         ("/mode", "cycle approval: confirm → auto-edit → auto (or Shift+Tab)"),
         ("/reasoning", "toggle reasoning display: full (scrollback) | collapsed (status row)"),
         ("/stats", "cumulative token + cache stats for this session"),
+        ("/todo", "view the session's todo list"),
         ("/compact", "summarise history and replace it with a compact summary"),
         ("/help", "show this help"),
         ("/quit", "exit (sessions are saved automatically)"),
@@ -1260,6 +1351,25 @@ def cmd_sessions(state: State, args: str) -> None:
     if not sessions:
         print(dim("No saved sessions yet."))
         return
+
+    # Interactive picker if terminal supports it
+    if _raw_capable():
+        labels = [f"{s.id}  {s.model}" for s in sessions]
+        descs = [f"{s.turn_count()}t · {s.title()}" for s in sessions]
+        current = f"{state.session.id}  {state.session.model}"
+        chosen = pick_from_list(labels, "Sessions", descriptions=descs, current=current, state=state)
+        if chosen:
+            sid = chosen.split("  ")[0]
+            target = next((s for s in sessions if s.id == sid), None)
+            if target:
+                state.session = target
+                state.cfg.model = target.model
+                _replay_conversation(state)
+                print(green(f"\nResumed {target.id} ({target.turn_count()} turns)."))
+        else:
+            print(yellow("Selection cancelled."))
+        return
+
     print(bold(f"{len(sessions)} session(s):"))
     for i, s in enumerate(sessions, 1):
         marker = green(" current") if s.id == state.session.id else ""
@@ -1281,7 +1391,8 @@ def cmd_connect(state: State, args: str) -> None:
         cfg.provider = args.strip()
     elif _raw_capable():
         labels = list(PROVIDER_LABELS.values())
-        chosen = pick_from_list(labels, "Select provider")
+        current_label = PROVIDER_LABELS.get(cfg.provider, "")
+        chosen = pick_from_list(labels, "Select provider", current=current_label, state=state)
         if chosen:
             # map label back to provider key
             for k, v in PROVIDER_LABELS.items():
@@ -1318,9 +1429,16 @@ def cmd_connect(state: State, args: str) -> None:
 
     # 3. pick model — interactive list if terminal supports it
     if models and _raw_capable():
-        if cfg.model in models:
-            models = [models.pop(models.index(cfg.model))] + models
-        chosen = pick_from_list(models, f"Select model ({label})")
+        from hrns.config import PRICING
+        descs = []
+        for m in models:
+            p = PRICING.get(m)
+            if p:
+                descs.append(f"${p['cache_miss']:.2f}/${p['output']:.2f} per Mtok")
+            else:
+                descs.append("")
+        chosen = pick_from_list(models, f"Select model ({label})",
+                                descriptions=descs, current=cfg.model, state=state)
         if chosen:
             cfg.model = chosen
         else:
@@ -1351,6 +1469,23 @@ def cmd_memory(state: State, args: str) -> None:
         print(green(f"Remembered ({n['id']}). Applies to new sessions."))
     elif sub == "rm" and rest:
         print(green("Removed.") if memory.remove(path, rest.strip()) else red("No such note id."))
+    elif sub == "rm":
+        # Interactive delete — pick from list
+        notes = memory.list_notes(path)
+        if not notes:
+            print(dim("No memory to remove."))
+            return
+        if _raw_capable():
+            labels = [n["id"] for n in notes]
+            descs = [n["text"][:80] for n in notes]
+            chosen = pick_from_list(labels, "Remove memory", descriptions=descs, state=state)
+            if chosen:
+                memory.remove(path, chosen)
+                print(green(f"Removed {chosen}."))
+            else:
+                print(yellow("Selection cancelled."))
+        else:
+            print(dim("Usage: /memory rm <id>"))
     elif sub == "clear":
         memory.clear(path)
         print(green("Memory cleared."))
@@ -1391,10 +1526,17 @@ def cmd_model(state: State, args: str) -> None:
             pass
 
     if models and _raw_capable():
-        if state.cfg.model in models:
-            models = [models.pop(models.index(state.cfg.model))] + models
         label = PROVIDER_LABELS.get(state.cfg.provider, state.cfg.provider)
-        chosen = pick_from_list(models, f"Select model ({label})")
+        # Build pricing descriptions for each model
+        descs = []
+        for m in models:
+            p = PRICING.get(m)
+            if p:
+                descs.append(f"${p['cache_miss']:.2f}/${p['output']:.2f} per Mtok")
+            else:
+                descs.append("")
+        chosen = pick_from_list(models, f"Select model ({label})",
+                                descriptions=descs, current=state.cfg.model, state=state)
         if chosen:
             state.cfg.model = chosen
             state.cfg.save()
@@ -1416,6 +1558,17 @@ def cmd_mode(state: State, args: str) -> None:
         state.approval_mode = arg
         state.cfg.approval_mode = arg
         state.cfg.save()
+    elif _raw_capable():
+        descs = [_MODE_DESC[m] for m in APPROVAL_MODES]
+        chosen = pick_from_list(APPROVAL_MODES, "Approval mode",
+                                descriptions=descs, current=state.approval_mode, state=state)
+        if chosen:
+            state.approval_mode = chosen
+            state.cfg.approval_mode = chosen
+            state.cfg.save()
+        else:
+            print(yellow("Selection cancelled."))
+            return
     else:
         _cycle_mode(state)
     print(f"approval mode: {mode_badge(state.approval_mode).strip()} "
@@ -1452,6 +1605,18 @@ def cmd_stats(state: State, args: str) -> None:
     p = pricing_for(s.model)
     saved = u["prompt_cache_hit_tokens"] / 1e6 * (p["cache_miss"] - p["cache_hit"])
     print(f"  cost       {_money(s.cost(p))}   {green(f'(cache saved {_money(saved)})')}")
+
+
+def cmd_todo(state: State, args: str) -> None:
+    todos = state.session.todos
+    if not todos:
+        print(dim("  (no todos)"))
+        return
+    for t in todos:
+        check = green("x") if t.get("done") else yellow("o")
+        print(f"  [{check}] {dim(t['id'])}  {t['text']}")
+    pending = len(state.session.pending_todos)
+    print(dim(f"  {pending}/{len(todos)} pending"))
 
 
 def cmd_compact(state: State, args: str) -> None:
@@ -1516,6 +1681,7 @@ COMMANDS = {
     "/mode": cmd_mode,
     "/reasoning": cmd_reasoning,
     "/stats": cmd_stats,
+    "/todo": cmd_todo,
     "/compact": cmd_compact,
 }
 
@@ -1554,6 +1720,22 @@ def _command_ghost(text: str) -> str:
         if c.startswith(text) and len(c) > len(text):
             return c[len(text):]
     return ""
+
+
+_CMD_DESCRIPTIONS = {
+    "/sessions": "list or resume sessions",
+    "/new": "start a fresh session",
+    "/connect": "configure API connection",
+    "/memory": "view or manage memory notes",
+    "/model": "show or set the model",
+    "/mode": "cycle approval mode",
+    "/reasoning": "toggle reasoning display",
+    "/stats": "show session statistics",
+    "/todo": "view the todo list",
+    "/compact": "summarize and compress history",
+    "/help": "show available commands",
+    "/quit": "exit hrns",
+}
 
 
 # --- the live status line shown above the prompt ----------------------
@@ -1720,110 +1902,38 @@ def _keys() -> _KeySource:
     return _KEY_SOURCE
 
 
-def pick_from_list(items: list[str], title: str = "Select") -> str | None:
-    """Interactive list picker — arrow keys, enter to select, esc to cancel.
+def pick_from_list(items: list[str], title: str = "Select",
+                   descriptions: list[str] | None = None,
+                   current: str | None = None,
+                   state: State | None = None) -> str | None:
+    """Interactive inline picker — rendered in the input dock.
 
-    Renders directly into the terminal, restores the cursor position on exit.
+    `descriptions` is an optional parallel list of dimmed metadata strings shown
+    after each item. `current` marks the active item with a bullet.
     Returns the selected item or None on cancel. Requires a TTY."""
-    n = len(items)
-    if n == 0:
+    if not items:
         return None
     if not _raw_capable():
         return None
 
-    idx = 0
-    query = ""         # filter buffer
-    filtered = items   # items matching the query
-    keys = _keys()
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
+    ta = state.typeahead if state else None
+    if not ta:
+        return None
 
-    # Drain any stale keystrokes buffered from the previous read_line
-    while keys.getch(0):
-        pass
+    # Set picker state on the TypeAhead — the reader thread renders and handles input
+    ta.picker_title = title
+    ta.picker_items = list(items)
+    ta.picker_descriptions = list(descriptions) if descriptions else [""] * len(items)
+    ta.picker_current = current or ""
+    ta.picker_selected = 0
+    ta.picker_query = ""
+    ta.picker_result = None
+    ta.picker_done.clear()
+    ta.idle_render()
 
-    # Find terminal height so we know how many items to show
-    size = shutil.get_terminal_size()
-    max_visible = max(3, min(n, size.lines - 4))
-
-    def _draw() -> None:
-        nonlocal filtered, idx
-        # If query changed, re-filter
-        if query:
-            q = query.lower().replace(" ", "")
-            filtered = [it for it in items if q in it.lower().replace(" ", "")]
-            if not filtered:
-                filtered = items
-            idx = max(0, min(idx, len(filtered) - 1))
-
-        # Scroll window so idx stays visible
-        half = max_visible // 2
-        start = max(0, min(idx - half, len(filtered) - max_visible))
-        end = start + max_visible
-
-        lines: list[str] = []
-        lines.append(f"\r\033[K{bold(cyan(title))}{dim(' · type to filter, ↑↓ to move, ↵ to select')}")
-        for i in range(start, end):
-            if i >= len(filtered):
-                break
-            prefix = " " + cyan("▸") if i == idx else "  "
-            line = prefix + " " + filtered[i]
-            if i == idx:
-                line = _c("7", line)  # reverse video for the cursor line
-            lines.append(f"\r\033[K{line}")
-        if query:
-            lines.append(f"\r\033[K{dim('filter: ' + query)}")
-        sys.stdout.write("\n".join(lines))
-        sys.stdout.flush()
-
-    # Save position, draw, then loop
-    sys.stdout.write("\0337")   # DECSC — save cursor
-    _draw()
-    try:
-        tty.setraw(fd)
-        while True:
-            ch = keys.getch(10)
-            if ch == "":
-                break
-            if ch == "\x1b":
-                # Could be arrow keys or bare ESC
-                nxt = keys.getch(0.05)
-                if nxt == "[":
-                    code = keys.getch(0.05)
-                    if code == "A":      # up
-                        idx = max(0, idx - 1)
-                    elif code == "B":    # down
-                        idx = min(len(filtered) - 1, idx + 1)
-                elif nxt == "":
-                    return None          # bare ESC = cancel
-                else:
-                    continue
-            elif ch == "\r":
-                if filtered and 0 <= idx < len(filtered):
-                    return filtered[idx]
-            elif ch in ("\x03", "\x04"):
-                return None              # Ctrl+C / Ctrl+D = cancel
-            elif ch == "\x7f":           # backspace
-                query = query[:-1]
-            elif ch.isprintable():
-                query += ch
-            else:
-                continue
-            # Reset filter on empty query
-            if not query:
-                filtered = items
-            # Move cursor back up and redraw
-            visible_lines = min(max_visible, len(filtered)) + (1 if query else 0)
-            sys.stdout.write(f"\033[{visible_lines}A")
-            _draw()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        # Restore cursor and clear picker area
-        sys.stdout.write("\0338")        # DECRC — restore cursor
-        # Clear the lines we drew (they're below the restored cursor)
-        drawn = 1 + min(max_visible, len(filtered)) + (1 if query else 0)
-        sys.stdout.write("\n" * drawn + f"\033[{drawn}A")
-        sys.stdout.flush()
+    # Block until the reader thread signals a selection or cancel
+    ta.picker_done.wait()
+    return ta.picker_result
 
 
 class LineEditor:
@@ -2201,6 +2311,18 @@ class TypeAhead:
         self._input_ready = threading.Event()
         self._input_text = ""
         self._input_pending = False
+        # inline command picker state (auto-triggered by /)
+        self.cmd_matches: list[str] = []
+        self.cmd_selected: int = 0
+        # generic picker state (used by /sessions, /model, /mode, /memory rm)
+        self.picker_title: str = ""
+        self.picker_items: list[str] = []
+        self.picker_descriptions: list[str] = []
+        self.picker_current: str = ""
+        self.picker_selected: int = 0
+        self.picker_query: str = ""
+        self.picker_result: Optional[str] = None
+        self.picker_done = threading.Event()
 
     @property
     def active(self) -> bool:
@@ -2324,10 +2446,30 @@ class TypeAhead:
                 cursor = self._editor.cursor
                 editing = self._edit_idx
                 queued = len(self.queue)
+                # Determine which picker is active (generic takes priority)
+                if self.picker_items:
+                    pf = self._picker_filtered()
+                    ps = self.picker_selected
+                    pd = self.picker_descriptions
+                    pi = self.picker_items
+                    pc = self.picker_current
+                    picker_active = True
+                elif self.cmd_matches:
+                    pf = self.cmd_matches
+                    ps = self.cmd_selected
+                    pd = [_CMD_DESCRIPTIONS.get(m, "") for m in self.cmd_matches]
+                    pi = self.cmd_matches
+                    pc = ""
+                    picker_active = True
+                else:
+                    pf = ps = pd = pi = pc = None
+                    picker_active = False
             head_parts: list[str] = []
             lead = mode_badge(self.state.approval_mode).strip()
             if lead:
                 head_parts.append(lead)
+            if self.picker_items:
+                head_parts.append(bold(cyan(self.picker_title)))
             if editing is not None:
                 head_parts.append(yellow(f"[editing {editing + 1}/{queued}]"))
             elif queued:
@@ -2335,8 +2477,20 @@ class TypeAhead:
             head = " · ".join(head_parts) if head_parts else ""
             foot = statusline(self.state)
             parts: list[str] = []
-            rows_n = _paint_input_box(parts, head, text, cursor,
-                                      block_cursor=False, foot=foot)
+            # When picker is active, hide the input text and reduce dock height
+            if picker_active:
+                render_text = ""
+                render_cursor = 0
+                n_items = min(len(pf), 6)
+                rows_n = _paint_input_box(parts, head, render_text, render_cursor,
+                                          block_cursor=False, foot=foot,
+                                          extra_rows=max(0, n_items - 1))
+            else:
+                render_text = text
+                render_cursor = cursor
+                n_items = 0
+                rows_n = _paint_input_box(parts, head, render_text, render_cursor,
+                                          block_cursor=False, foot=foot)
             if rows_n == 0:
                 ghost = _command_ghost(text)
                 flat = text.replace("\n", " ")
@@ -2344,6 +2498,36 @@ class TypeAhead:
                 after = (len(text) - cursor) + len(ghost)
                 if after > 0:
                     parts.append(f"\033[{after}D")
+            # Draw picker rows — overwrite the empty input row when active
+            if rows_n > 0 and picker_active and pf:
+                cmd_start = rows_n - _Dock.height + 2  # overwrite the input row
+                max_visible = n_items
+                total = len(pf)
+                if total <= max_visible:
+                    visible = pf
+                    descs = pd[:total] if pd else []
+                    sel_off = ps
+                else:
+                    half = max_visible // 2
+                    start = max(0, min(ps - half, total - max_visible))
+                    visible = pf[start:start + max_visible]
+                    descs = pd[start:start + max_visible] if pd else []
+                    sel_off = ps - start
+                for i, item in enumerate(visible):
+                    if i == sel_off:
+                        line = bold(cyan(" ▸ ")) + bold(item)
+                        if pc and item == pc:
+                            line += bold(cyan(" ●"))
+                        desc = descs[i] if i < len(descs) else ""
+                        if desc:
+                            line += dim(f"  — {desc}")
+                    else:
+                        marker = cyan(" ●") if pc and item == pc else "   "
+                        desc = descs[i] if i < len(descs) else ""
+                        line = dim("   ") + dim(item) + marker
+                        if desc:
+                            line += dim(f"  {desc}")
+                    parts.append(f"\033[{cmd_start + i};1H\033[K" + _box_mid(line))
             sys.stdout.write("".join(parts))
             sys.stdout.flush()
 
@@ -2426,6 +2610,11 @@ class TypeAhead:
             self._not_editing.set()                   # never strand a waiter
 
     def _on_key(self, ch: str, getch: Callable[[], str]) -> None:
+        # If a generic picker is active, route all input there
+        if self.picker_items:
+            self._handle_picker(ch)
+            return
+
         with self._lock:
             in_request = self._req_prompt is not None
             act = self._editor.handle(ch, getch)
@@ -2455,6 +2644,51 @@ class TypeAhead:
         # the spinner's io lock, so we must not hold ours — see the deadlock
         # fixed in 5be1f5f).
         note: Optional[str] = None
+
+        # Update command picker matches on every edit
+        if act == "edit":
+            with self._lock:
+                txt = self._editor.text()
+            if txt.startswith("/") and " " not in txt:
+                names = sorted((set(COMMANDS) | {"/quit"}) - {"/?"})
+                q = txt.lower()
+                self.cmd_matches = [c for c in names if c.startswith(q)]
+                self.cmd_selected = max(0, min(self.cmd_selected, len(self.cmd_matches) - 1))
+            else:
+                self.cmd_matches = []
+                self.cmd_selected = 0
+
+        # When command picker is visible, redirect navigation/selection
+        if self.cmd_matches:
+            if act == "up":
+                self.cmd_selected = max(0, self.cmd_selected - 1)
+                self.idle_render()
+                return
+            if act == "down":
+                self.cmd_selected = min(len(self.cmd_matches) - 1, self.cmd_selected + 1)
+                self.idle_render()
+                return
+            if act == "submit":
+                # Execute the selected command immediately
+                chosen = self.cmd_matches[self.cmd_selected]
+                self.cmd_matches = []
+                self.cmd_selected = 0
+                with self._lock:
+                    self._editor.set_text("")
+                    self._input_text = chosen
+                    self._input_pending = True
+                self._input_ready.set()
+                return
+            if act == "tab":
+                # Fill the editor with the selected command (for adding args)
+                chosen = self.cmd_matches[self.cmd_selected]
+                with self._lock:
+                    self._editor.set_text(chosen + " ")
+                self.cmd_matches = []
+                self.cmd_selected = 0
+                self.idle_render()
+                return
+
         if act == "submit":
             note = self._commit_submit(submit_text)
         elif act == "up":
@@ -2465,10 +2699,7 @@ class TypeAhead:
             _cycle_mode(self.state)
             note = dim("  approval mode → ") + mode_badge(self.state.approval_mode).strip()
         elif act == "tab":
-            with self._lock:
-                matches = _complete_command(self._editor)
-            if matches:                               # ambiguous — list candidates
-                note = dim("  " + "  ".join(matches))
+            pass  # inline command picker handles tab selection
         elif act == "eof":
             if self._spinner is None:        # idle Ctrl-D — signal EOF to exit
                 with self._lock:
@@ -2486,6 +2717,69 @@ class TypeAhead:
                 sys.stdout.write("\n" + note + "\n")
                 sys.stdout.flush()
             self.idle_render()
+
+    # --- generic picker (runs in reader thread, blocking main thread) ---------
+    def _handle_picker(self, ch: str) -> None:
+        """Handle a keystroke while a generic picker is active. The main thread
+        is blocked on picker_done; this method navigates, filters, and selects."""
+        act = self._editor.handle(ch, lambda: "")
+        items = self.picker_items
+        desc = self.picker_descriptions
+
+        # Filter based on typed characters
+        if act == "edit":
+            self.picker_query = self._editor.text()
+        elif act == "up":
+            self.picker_selected = max(0, self.picker_selected - 1)
+        elif act == "down":
+            filtered = self._picker_filtered()
+            self.picker_selected = min(len(filtered) - 1, self.picker_selected + 1)
+        elif act == "submit":
+            filtered = self._picker_filtered()
+            if filtered and 0 <= self.picker_selected < len(filtered):
+                self.picker_result = filtered[self.picker_selected]
+            else:
+                self.picker_result = None
+            self._picker_clear()
+            self.picker_done.set()
+            return
+        elif act == "interrupt" or act == "eof":
+            self.picker_result = None
+            self._picker_clear()
+            self.picker_done.set()
+            return
+        elif act == "tab":
+            filtered = self._picker_filtered()
+            if filtered and 0 <= self.picker_selected < len(filtered):
+                self.picker_result = filtered[self.picker_selected]
+            else:
+                self.picker_result = None
+            self._picker_clear()
+            self.picker_done.set()
+            return
+
+        # Re-filter and clamp selection
+        filtered = self._picker_filtered()
+        self.picker_selected = max(0, min(self.picker_selected, len(filtered) - 1))
+        self.idle_render()
+
+    def _picker_filtered(self) -> list[str]:
+        """Return items matching the current picker query."""
+        q = self.picker_query.lower().replace(" ", "")
+        if not q:
+            return self.picker_items
+        return [it for it in self.picker_items if q in it.lower().replace(" ", "")] or self.picker_items
+
+    def _picker_clear(self) -> None:
+        """Reset picker state."""
+        self.picker_items = []
+        self.picker_descriptions = []
+        self.picker_current = ""
+        self.picker_selected = 0
+        self.picker_query = ""
+        self._editor.set_text("")
+        self.cmd_matches = []
+        self.cmd_selected = 0
 
     # --- queue editing (driven from _on_key, runs in the reader thread) ---
     def _commit_submit(self, text: str) -> Optional[str]:
@@ -2621,6 +2915,7 @@ def main() -> None:
         except DeepSeekError:
             client = None
     state = State(cfg=cfg, session=session, client=client, approval_mode=cfg.approval_mode)
+    tools.TODO_LIST = session.todos  # so save_todo operates on the session's list
 
     # fetch starting balance
     if state.client:
@@ -2631,6 +2926,7 @@ def main() -> None:
     if sessions:
         _replay_conversation(state)
     typeahead = TypeAhead(state)
+    state.typeahead = typeahead
     prompt_fn = lambda: bold(magenta("▸ "))  # noqa: E731
     docked = _raw_capable()
     # Start TypeAhead once — it stays alive for the entire session.

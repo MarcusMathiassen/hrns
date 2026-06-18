@@ -31,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -286,6 +287,40 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_todo",
+            "description": (
+                "Manage a session-scoped todo list for tracking your work plan. "
+                "Use 'add' to add a task, 'done' to mark it complete by id, "
+                "'list' to see all items, and 'clear' to remove all done items. "
+                "The todo list is persisted with the session. Use this to break "
+                "down complex tasks, track progress, and show the user what you're "
+                "working on. After adding or completing items, the response "
+                "includes the current todo state."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "done", "list", "clear"],
+                        "description": "The action to perform.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Task description (required for 'add').",
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Task id (required for 'done').",
+                    },
+                },
+                "required": ["action"],
             },
         },
     },
@@ -557,6 +592,7 @@ def _run_bash(args: dict) -> str:
 
 # --- memory path, set by the CLI on startup --------------------------
 MEMORY_PATH: Optional[Path] = None
+TODO_LIST: list[dict[str, Any]] = []  # set from cli.py → session.todos
 
 
 def _save_memory(args: dict) -> str:
@@ -573,6 +609,48 @@ def _save_memory(args: dict) -> str:
     return f"Saved memory {note['id']}: {text[:120]}"
 
 
+def _save_todo(args: dict) -> str:
+    """Manage the session-scoped todo list."""
+    action = str(args.get("action", "")).strip()
+    if action == "add":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "ERROR: 'text' is required for 'add'."
+        item = {"id": uuid.uuid4().hex[:6], "text": text, "done": False}
+        TODO_LIST.append(item)
+        return _todo_status(f"Added [{item['id']}]: {text}")
+    if action == "done":
+        tid = str(args.get("id", "")).strip()
+        if not tid:
+            return "ERROR: 'id' is required for 'done'."
+        for t in TODO_LIST:
+            if t["id"] == tid:
+                t["done"] = True
+                return _todo_status(f"Completed [{tid}]: {t['text']}")
+        return f"ERROR: no todo with id '{tid}'."
+    if action == "clear":
+        before = len(TODO_LIST)
+        TODO_LIST[:] = [t for t in TODO_LIST if not t.get("done")]
+        cleared = before - len(TODO_LIST)
+        return _todo_status(f"Cleared {cleared} completed item(s).")
+    if action == "list":
+        return _todo_status()
+    return f"ERROR: unknown action '{action}'. Use add/done/list/clear."
+
+
+def _todo_status(prefix: str = "") -> str:
+    """Render the current todo list as a compact string."""
+    if not TODO_LIST:
+        line = "(empty)"
+    else:
+        lines = []
+        for t in TODO_LIST:
+            check = "x" if t.get("done") else " "
+            lines.append(f"  [{check}] {t['id']}  {t['text']}")
+        line = "\n".join(lines)
+    return f"{prefix}\n{line}" if prefix else line
+
+
 _DISPATCH: dict[str, Callable[[dict], str]] = {
     "read_file": _read_file,
     "list_dir": _list_dir,
@@ -582,6 +660,7 @@ _DISPATCH: dict[str, Callable[[dict], str]] = {
     "create_file": _create_file,
     "run_bash": _run_bash,
     "save_memory": _save_memory,
+    "save_todo": _save_todo,
 }
 
 

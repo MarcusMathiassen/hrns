@@ -69,6 +69,8 @@ class Session:
     # current context size (tokens) — the latest request's prompt + completion.
     # This is the exact size from the API, not an estimate.
     context_tokens: int = 0
+    # session-scoped todo list, managed by the model via save_todo
+    todos: list[dict[str, Any]] = field(default_factory=list)
 
     # --- lifecycle -----------------------------------------------------
     @classmethod
@@ -94,6 +96,7 @@ class Session:
         )
         s.usage.update(data.get("usage", {}))
         s.context_tokens = int(data.get("context_tokens", 0) or 0)
+        s.todos = data.get("todos", [])
         # Heal logs poisoned by an empty stream before the client guarded
         # against it: an assistant message with neither content nor tool_calls
         # is rejected by the API ("content or tool_calls must be set"), so
@@ -115,6 +118,7 @@ class Session:
             "transcript": self.transcript,
             "usage": self.usage,
             "context_tokens": self.context_tokens,
+            "todos": self.todos,
         }
 
     # --- append-only mutation -----------------------------------------
@@ -156,6 +160,10 @@ class Session:
         return Session.from_dict(data) if data else None
 
     # --- helpers for display ------------------------------------------
+    @property
+    def pending_todos(self) -> list[dict[str, Any]]:
+        return [t for t in self.todos if not t.get("done")]
+
     @property
     def cache_hit_rate(self) -> float:
         hit = self.usage["prompt_cache_hit_tokens"]
