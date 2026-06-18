@@ -319,7 +319,10 @@ def _human_bytes(n: int) -> str:
 def _atomic_write(p: Path, text: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".hrns.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
