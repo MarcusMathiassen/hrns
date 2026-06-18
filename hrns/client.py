@@ -183,6 +183,17 @@ class DeepSeekClient:
 
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                    # Normalize cache stats: DeepSeek returns flat
+                    # prompt_cache_hit/miss_tokens; MiMo (OpenAI-compatible)
+                    # returns prompt_tokens_details.cached_tokens. Flatten
+                    # to the DeepSeek format so the rest of the codebase
+                    # has one path.
+                    if "prompt_cache_hit_tokens" not in usage:
+                        details = usage.get("prompt_tokens_details") or {}
+                        cached = int(details.get("cached_tokens", 0) or 0)
+                        prompt = int(usage.get("prompt_tokens", 0) or 0)
+                        usage["prompt_cache_hit_tokens"] = cached
+                        usage["prompt_cache_miss_tokens"] = max(0, prompt - cached)
 
                 choices = chunk.get("choices") or []
                 if not choices:
