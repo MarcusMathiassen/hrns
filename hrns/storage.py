@@ -30,6 +30,8 @@ def write_json(path: Path, data: Any) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
