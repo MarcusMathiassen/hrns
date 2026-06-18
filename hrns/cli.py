@@ -1493,10 +1493,14 @@ def cmd_compact(state: State, args: str) -> None:
     session.record_usage(result.usage)
     _say(session, "meta", dim("  compact ·") + _api_stats(session.model, result.usage, elapsed))
 
+    # Repair any dangling tool calls from an interrupted turn before compacting,
+    # so the message log stays valid.
+    _repair_dangling_tool_calls(session)
+
     system = session.messages[0]
     session.messages.clear()
     session.messages.append(system)
-    session.messages.append({"role": "user", "content": summary})
+    session.messages.append({"role": "assistant", "content": summary})
     # approximate context — roughly the messages we now hold
     session.context_tokens = sum(len(str(m)) for m in session.messages) // 4
     _say(session, "meta", green(f"Compacted {len(non_system)} messages into a summary."))
