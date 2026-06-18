@@ -546,7 +546,11 @@ def _run_bash(args: dict) -> str:
         return f"ERROR: `{cmd}` timed out after {timeout}s"
     except Exception as e:  # noqa: BLE001
         return f"ERROR running `{cmd}`: {e}"
-    out_text = (out or "") + (err or "")
+    out, err = out or "", err or ""
+    if out and err:
+        out_text = out.rstrip("\n") + "\n--- stderr ---\n" + err
+    else:
+        out_text = out + err
     status = "exit 0" if proc.returncode == 0 else f"exit {proc.returncode}"
     return _truncate(f"[{status}]\n{out_text}".rstrip())
 
