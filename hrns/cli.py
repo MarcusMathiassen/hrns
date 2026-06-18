@@ -1889,8 +1889,10 @@ class LineEditor:
         """Apply one keypress. Returns: submit / interrupt / eof /
         clear-screen / shift-tab / tab / up / down / edit.
 
-        Plain Enter (\\r) submits; Shift/Alt+Enter and pasted newlines insert a
-        literal newline (multi-line prompts). Backspace deletes a char; Ctrl+W
+        Enter submits whether it arrives as CR (\\r) or LF (\\n) — terminals and
+        keyboards disagree on which the Return key sends, and ICRNL mapping can
+        flip one into the other. Shift/Alt+Enter (an ESC sequence) and bracketed
+        pastes still insert literal newlines. Backspace deletes a char; Ctrl+W
         and Ctrl/Shift+Backspace (where the terminal encodes the modifier, plus
         Ctrl-H) delete the previous word."""
         if self._in_paste:                            # paste — batch everything except ESC
@@ -1898,11 +1900,8 @@ class LineEditor:
                 return self._escape(getch)
             self._paste_buf.append(ch)                # raw — line-endings normalised at flush
             return "edit"
-        if ch == "\r":                                # Enter — submit
+        if ch in ("\r", "\n"):                        # Enter — submit (CR or LF)
             return "submit"
-        if ch == "\n":                                # newline (paste / Ctrl+J) — insert
-            self._insert("\n")
-            return "edit"
         if ch == "\x03":
             return "interrupt"
         if ch == "\x04":
@@ -2196,9 +2195,12 @@ class TypeAhead:
         self._edit_hinted = False
         self._not_editing = threading.Event()
         self._not_editing.set()
-        # wait_for_input: main thread blocks until the reader thread submits
+        # wait_for_input: main thread blocks until the reader thread submits.
+        # _input_pending (guarded by _lock) gates _input_text so a stray event
+        # set can't deliver a stale line and the wakeup can't be lost.
         self._input_ready = threading.Event()
         self._input_text = ""
+        self._input_pending = False
 
     @property
     def active(self) -> bool:
@@ -2238,6 +2240,20 @@ class TypeAhead:
         fd = sys.stdin.fileno()
         self._saved = termios.tcgetattr(fd)
         tty.setcbreak(fd)
+        # setcbreak leaves the input flags untouched, so ICRNL stays on and the
+        # terminal maps the Enter key's CR to NL before we ever see it.  Clear
+        # the CR/NL input mappings so Enter arrives as "\r".  (handle() now
+        # submits on either "\r" or "\n", so a terminal that sends LF anyway
+        # still works — this just keeps the two distinct.)  read_line did this
+        # via raw mode; we stay in cbreak so ISIG keeps Ctrl-C interrupting.
+        mode = termios.tcgetattr(fd)
+        mode[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)
+        termios.tcsetattr(fd, termios.TCSADRAIN, mode)
+        # Enable bracketed paste so multi-line pastes arrive wrapped in
+        # CSI 200~/201~ and get batched into the draft, instead of each pasted
+        # newline submitting a separate prompt now that "\n" means submit.
+        sys.stdout.write("\033[?2004h")
+        sys.stdout.flush()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -2266,6 +2282,8 @@ class TypeAhead:
         self._stop.set()
         self._thread.join()
         self._thread = None
+        sys.stdout.write("\033[?2004l")   # disable bracketed paste
+        sys.stdout.flush()
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
         if self._spinner is not None:
             self._spinner.extra = None
@@ -2274,14 +2292,23 @@ class TypeAhead:
             self._spinner = None
 
     def wait_for_input(self) -> str:
-        """Block the main thread until the user submits a line.
+        """Block the main thread until the reader thread hands over a line.
 
-        Called from _main_loop when the queue is empty. The reader thread
-        captures keystrokes and, on Enter, queues the text and signals
-        this event. Returns the submitted text (may be empty on Ctrl-C)."""
-        self._input_ready.clear()
-        self._input_ready.wait()
-        return self._input_text
+        Called from _main_loop when the queue is empty.  The reader thread
+        captures keystrokes and, on idle Enter, stores the text and sets the
+        event; on Ctrl-D it stores "" to signal EOF.  Returns the submitted
+        text — an empty string means EOF, which the caller treats as exit.
+
+        Clearing the event only after re-checking `_input_pending` under the
+        lock means a submit landing between the caller's pop_queued() and this
+        wait() is consumed, not lost."""
+        while True:
+            self._input_ready.wait()
+            with self._lock:
+                self._input_ready.clear()
+                if self._input_pending:
+                    self._input_pending = False
+                    return self._input_text
 
     def idle_render(self) -> None:
         """Paint the idle input dock. Called from the reader thread after
@@ -2443,8 +2470,10 @@ class TypeAhead:
             if matches:                               # ambiguous — list candidates
                 note = dim("  " + "  ".join(matches))
         elif act == "eof":
-            if not self._spinner:
-                self._input_text = ""
+            if self._spinner is None:        # idle Ctrl-D — signal EOF to exit
+                with self._lock:
+                    self._input_text = ""
+                    self._input_pending = True
                 self._input_ready.set()
                 return
 
@@ -2460,19 +2489,23 @@ class TypeAhead:
 
     # --- queue editing (driven from _on_key, runs in the reader thread) ---
     def _commit_submit(self, text: str) -> Optional[str]:
-        """Enter pressed. While editing a queued slot this saves the edit back
-        (empty text drops that slot); otherwise it queues `text` as a new
-        prompt and, when idle, wakes the main thread."""
+        """Enter pressed.  While editing a queued slot this saves the edit back
+        (empty text drops that slot).  Idle (no turn running): hand the line
+        straight to the blocked main thread.  Mid-turn: append it to the queue
+        to run once the current turn finishes."""
         with self._lock:
             if self._edit_idx is not None:
                 return self._finish_edit_locked(text)
-            if text:
+            idle = self._spinner is None
+            if text and not idle:
                 self.queue.append(text)
             self._editor.set_text("")
-        # idle (no spinner): signal the main thread to pop from the queue
-        if text and not self._spinner:
-            self._input_text = text
+            if text and idle:
+                self._input_text = text
+                self._input_pending = True
+        if text and idle:
             self._input_ready.set()
+            return None                  # the main loop echoes the line itself
         if not text:
             return None
         return "\n".join(dim("  + queued: " + ln) for ln in text.split("\n"))
@@ -2613,6 +2646,27 @@ def main() -> None:
     print(dim(f"Saved session {state.session.id}. Bye."))
 
 
+def _echo_into_flow(prompt_fn, text: str, suffix: str = "") -> None:
+    """Echo a submitted line into the scrolling flow, just above the dock.
+
+    After idle_render the cursor sits in the dock — below the DECSTBM scroll
+    region — so a bare print would land on (and scroll within) the dock rows,
+    not the flow. That's why `/stats` and other command output went missing:
+    it was written below the margins. Drop to the flow's last row first
+    (clearing the dock's input rows so the just-typed draft doesn't linger),
+    then echo, mirroring read_line's submit branch. With no dock active a plain
+    print is correct."""
+    shown = _input_display(text) + suffix
+    if _Dock.active:
+        flow = _Dock.rows - _Dock.height
+        clear = "".join(f"\033[{flow + 2 + i};1H\033[K" + _box_mid("")
+                        for i in range(_Dock.height - 2))
+        sys.stdout.write(clear + f"\033[{flow};1H\r\n" + prompt_fn() + shown + "\r\n")
+        sys.stdout.flush()
+    else:
+        print(prompt_fn() + shown)
+
+
 def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
                prompt_fn, docked: bool) -> None:
     while True:
@@ -2623,25 +2677,18 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
         line = typeahead.pop_queued()
         if line is not None:
             line = line.strip()
-            if docked:
-                # Echo the queued prompt into the flow above the dock
-                sys.stdout.write("\n" + prompt_fn() + _input_display(line)
-                                 + dim("  (queued)") + "\n")
-                sys.stdout.flush()
-            else:
-                print(prompt_fn() + _input_display(line) + dim("  (queued)"))
+            _echo_into_flow(prompt_fn, line, dim("  (queued)"))
         elif docked:
-            # Queue empty — block until the reader thread submits
+            # Queue empty — block until the reader thread hands over a line
             try:
                 line = typeahead.wait_for_input().strip()
             except KeyboardInterrupt:
                 print()
                 return
-            if not line:
-                continue
-            # Echo into the flow
-            sys.stdout.write("\n" + prompt_fn() + _input_display(line) + "\n")
-            sys.stdout.flush()
+            if not line:           # empty == Ctrl-D (EOF) — exit cleanly
+                print()
+                return
+            _echo_into_flow(prompt_fn, line)
         else:
             try:
                 line = input(prompt_fn()).strip()
