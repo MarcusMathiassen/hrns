@@ -41,9 +41,9 @@ PRICING: dict[str, dict[str, float]] = {
     # MiMo  (cache_hit = input_cache_read, cache_miss = prompt, output = completion)
     "mimo-v2.5":       {"cache_hit": 0.0028,  "cache_miss": 0.14,  "output": 0.28},
     "mimo-v2.5-pro":   {"cache_hit": 0.0036,  "cache_miss": 0.435, "output": 0.87},
-    "mimo-v2-flash":   {"cache_hit": 0.01,    "cache_miss": 0.10,  "output": 0.30},
-    "mimo-v2-pro":     {"cache_hit": 0.20,    "cache_miss": 1.00,  "output": 3.00},
-    "mimo-v2-omni":    {"cache_hit": 0.08,    "cache_miss": 0.40,  "output": 2.00},
+    "mimo-v2-flash":   {"cache_hit": 0.0028,  "cache_miss": 0.14,  "output": 0.28},
+    "mimo-v2-pro":     {"cache_hit": 0.0036,  "cache_miss": 0.435, "output": 0.87},
+    "mimo-v2-omni":    {"cache_hit": 0.0028,  "cache_miss": 0.14,  "output": 0.28},
 }
 
 
