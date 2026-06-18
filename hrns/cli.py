@@ -883,7 +883,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
     assert client is not None
 
     spinner = Spinner(state)
-    typeahead.start(spinner)  # attach dock hooks first so no frame paints inline
+    typeahead.set_hooks(spinner)  # spinner takes over the dock from idle mode
     state.last_head = ""             # clear the idle ghost
     spinner.start("calling api")
     spinner.set("calling api", PHASE_CALL)
@@ -1025,7 +1025,7 @@ def run_turn(state: State, user_input: str, typeahead: TypeAhead) -> None:
                     typeahead.cancel_edit()
         state.last_head = spinner.last_head()  # freeze for the idle prompt
         spinner.stop()    # before the hooks detach, so no frame paints inline
-        typeahead.stop()
+        typeahead.set_hooks(None)  # return dock to idle mode
 
     if interrupted:
         _repair_dangling_tool_calls(session)
@@ -2182,6 +2182,8 @@ class TypeAhead:
         self._thread: Optional[threading.Thread] = None
         self._saved: Optional[list] = None
         self._spinner: Optional[Spinner] = None
+        self._render_idle: Optional[Callable[[], None]] = None
+        self._render_lock = threading.Lock()
         # request_line plumbing (confirm prompts borrow the keyboard)
         self._req_prompt: Optional[str] = None
         self._req_text = ""
@@ -2194,6 +2196,9 @@ class TypeAhead:
         self._edit_hinted = False
         self._not_editing = threading.Event()
         self._not_editing.set()
+        # wait_for_input: main thread blocks until the reader thread submits
+        self._input_ready = threading.Event()
+        self._input_text = ""
 
     @property
     def active(self) -> bool:
@@ -2220,19 +2225,40 @@ class TypeAhead:
                 self._edit_hinted = False
         self._not_editing.set()
 
-    def start(self, spinner: Spinner) -> None:
+    def start(self, spinner: Optional[Spinner] = None,
+              render_idle: Optional[Callable[[], None]] = None) -> None:
         if not _raw_capable() or self.active:
             return
-        self._spinner = spinner
-        spinner.extra = self._badge          # queued count, on the status row
-        spinner.lead = lambda: mode_badge(self.state.approval_mode).strip()
-        spinner.input_state = self._input_state   # (text, cursor, confirm prompt)
+        self._render_idle = render_idle
+        if spinner is not None:
+            self._spinner = spinner
+            spinner.extra = self._badge
+            spinner.lead = lambda: mode_badge(self.state.approval_mode).strip()
+            spinner.input_state = self._input_state
         fd = sys.stdin.fileno()
         self._saved = termios.tcgetattr(fd)
         tty.setcbreak(fd)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def set_hooks(self, spinner: Optional[Spinner]) -> None:
+        """Attach (or detach) a spinner for turn-mode rendering.
+
+        When `spinner` is set, the spinner owns the dock and idle rendering
+        is suppressed.  When None, the spinner's hooks are cleared and idle
+        rendering resumes."""
+        if spinner is not None:
+            self._spinner = spinner
+            spinner.extra = self._badge
+            spinner.lead = lambda: mode_badge(self.state.approval_mode).strip()
+            spinner.input_state = self._input_state
+        else:
+            if self._spinner is not None:
+                self._spinner.extra = None
+                self._spinner.lead = None
+                self._spinner.input_state = None
+            self._spinner = None
 
     def stop(self) -> None:
         if not self.active:
@@ -2246,6 +2272,53 @@ class TypeAhead:
             self._spinner.lead = None
             self._spinner.input_state = None
             self._spinner = None
+
+    def wait_for_input(self) -> str:
+        """Block the main thread until the user submits a line.
+
+        Called from _main_loop when the queue is empty. The reader thread
+        captures keystrokes and, on Enter, queues the text and signals
+        this event. Returns the submitted text (may be empty on Ctrl-C)."""
+        self._input_ready.clear()
+        self._input_ready.wait()
+        return self._input_text
+
+    def idle_render(self) -> None:
+        """Paint the idle input dock. Called from the reader thread after
+        each keystroke when no turn is running (spinner is None)."""
+        if self._spinner is not None:
+            return                          # spinner owns the dock during turns
+        self._do_idle_render()
+
+    def _do_idle_render(self) -> None:
+        with self._render_lock:
+            with self._lock:
+                text = self._editor.text()
+                cursor = self._editor.cursor
+                editing = self._edit_idx
+                queued = len(self.queue)
+            head_parts: list[str] = []
+            lead = mode_badge(self.state.approval_mode).strip()
+            if lead:
+                head_parts.append(lead)
+            if editing is not None:
+                head_parts.append(yellow(f"[editing {editing + 1}/{queued}]"))
+            elif queued:
+                head_parts.append(yellow(f"[{queued} queued]"))
+            head = " · ".join(head_parts) if head_parts else ""
+            foot = statusline(self.state)
+            parts: list[str] = []
+            rows_n = _paint_input_box(parts, head, text, cursor,
+                                      block_cursor=False, foot=foot)
+            if rows_n == 0:
+                ghost = _command_ghost(text)
+                flat = text.replace("\n", " ")
+                parts.append("\r\033[K" + flat + dim(ghost))
+                after = (len(text) - cursor) + len(ghost)
+                if after > 0:
+                    parts.append(f"\033[{after}D")
+            sys.stdout.write("".join(parts))
+            sys.stdout.flush()
 
     def take_text(self) -> str:
         """Surrender the unsubmitted draft (pre-fills the next prompt)."""
@@ -2369,27 +2442,40 @@ class TypeAhead:
                 matches = _complete_command(self._editor)
             if matches:                               # ambiguous — list candidates
                 note = dim("  " + "  ".join(matches))
-        # eof / interrupt / clear-screen make no sense mid-turn — ignored
+        elif act == "eof":
+            if not self._spinner:
+                self._input_text = ""
+                self._input_ready.set()
+                return
 
         if note and self._spinner:
             self._spinner.println(note)
         if self._spinner:
             self._spinner.render_now()
+        else:
+            if note:
+                sys.stdout.write("\n" + note + "\n")
+                sys.stdout.flush()
+            self.idle_render()
 
     # --- queue editing (driven from _on_key, runs in the reader thread) ---
     def _commit_submit(self, text: str) -> Optional[str]:
         """Enter pressed. While editing a queued slot this saves the edit back
         (empty text drops that slot); otherwise it queues `text` as a new
-        prompt."""
+        prompt and, when idle, wakes the main thread."""
         with self._lock:
             if self._edit_idx is not None:
                 return self._finish_edit_locked(text)
             if text:
                 self.queue.append(text)
             self._editor.set_text("")
-            if not text:
-                return None
-            return "\n".join(dim("  + queued: " + ln) for ln in text.split("\n"))
+        # idle (no spinner): signal the main thread to pop from the queue
+        if text and not self._spinner:
+            self._input_text = text
+            self._input_ready.set()
+        if not text:
+            return None
+        return "\n".join(dim("  + queued: " + ln) for ln in text.split("\n"))
 
     def _nav_queue(self, direction: int) -> Optional[str]:
         """Up (-1) / Down (+1) through queued prompts for editing. Up from the
@@ -2478,8 +2564,8 @@ def banner(state: State) -> None:
     cyc = "shift+tab" if _raw_capable() else "/mode"
     print(dim(f"  approval {state.approval_mode} ({cyc} to cycle) · /help · Ctrl-D to exit"))
     if _raw_capable():
-        print(dim("  type while it works — Enter queues your next prompt · ↑ edits a queued one · Ctrl-C interrupts"))
-        print(dim("  Shift+Enter for a newline · drag an image in to attach it"))
+        print(dim("  Enter queues a prompt · ↑/↓ edit queued · Shift+Enter newline · Ctrl-C interrupts"))
+        print(dim("  drag an image in to attach it"))
 
 
 def main() -> None:
@@ -2514,9 +2600,14 @@ def main() -> None:
     typeahead = TypeAhead(state)
     prompt_fn = lambda: bold(magenta("▸ "))  # noqa: E731
     docked = _raw_capable()
+    # Start TypeAhead once — it stays alive for the entire session.
+    if docked:
+        typeahead.start(render_idle=typeahead.idle_render)
+        typeahead.idle_render()
     try:
         _main_loop(state, cfg, typeahead, prompt_fn, docked)
     finally:
+        typeahead.stop()
         _undock()
     state.session.save(cfg.sessions_dir)
     print(dim(f"Saved session {state.session.id}. Bye."))
@@ -2526,22 +2617,39 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
                prompt_fn, docked: bool) -> None:
     while True:
         if not docked:
-            # no dock (pipe / dumb terminal): print the vitals inline instead
             print("\n" + statusline(state))
             print(_divider())
-        from_queue = typeahead.pop_queued()
-        if from_queue is not None:
-            # a prompt queued while the previous turn ran — echo it like input
-            line = from_queue.strip()
-            print(("\n" if docked else "") + prompt_fn() + _input_display(line) + dim("  (queued)"))
+        # The queue is the single source of truth: always pull from it.
+        line = typeahead.pop_queued()
+        if line is not None:
+            line = line.strip()
+            if docked:
+                # Echo the queued prompt into the flow above the dock
+                sys.stdout.write("\n" + prompt_fn() + _input_display(line)
+                                 + dim("  (queued)") + "\n")
+                sys.stdout.flush()
+            else:
+                print(prompt_fn() + _input_display(line) + dim("  (queued)"))
+        elif docked:
+            # Queue empty — block until the reader thread submits
+            try:
+                line = typeahead.wait_for_input().strip()
+            except KeyboardInterrupt:
+                print()
+                return
+            if not line:
+                continue
+            # Echo into the flow
+            sys.stdout.write("\n" + prompt_fn() + _input_display(line) + "\n")
+            sys.stdout.flush()
         else:
             try:
-                line = read_line(prompt_fn, state, initial=typeahead.take_text()).strip()
+                line = input(prompt_fn()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return
-        if not line:
-            continue
+            if not line:
+                continue
 
         if line.startswith("/"):
             cmd = line.split(maxsplit=1)[0]
@@ -2556,20 +2664,27 @@ def _main_loop(state: State, cfg: Config, typeahead: TypeAhead,
                     print(yellow("\ninterrupted"))
             else:
                 print(red(f"Unknown command {cmd}. Try /help."))
+            # After a command, re-render the idle input and loop
+            if docked:
+                typeahead.idle_render()
             continue
 
         if state.client is None:
             print(yellow("Not connected. Run /connect to set your API key."))
+            if docked:
+                typeahead.idle_render()
             continue
 
-        echo = prompt_fn() + _input_display(line) + (dim("  (queued)") if from_queue else "")
+        echo = prompt_fn() + _input_display(line)
         state.session.log("user", "\n" + echo)
         try:
             run_turn(state, line, typeahead)
         except KeyboardInterrupt:
-            # ^C that landed outside run_turn's own guard (e.g. while saving)
             print(yellow("\ninterrupted"))
             state.session.save(cfg.sessions_dir)
+        # Re-render the idle input after the turn ends
+        if docked:
+            typeahead.idle_render()
 
 
 if __name__ == "__main__":
