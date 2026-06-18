@@ -2614,7 +2614,7 @@ class TypeAhead:
     def _on_key(self, ch: str, getch: Callable[[], str]) -> None:
         # If a generic picker is active, route all input there
         if self.picker_items:
-            self._handle_picker(ch)
+            self._handle_picker(ch, getch)
             return
 
         with self._lock:
@@ -2721,10 +2721,10 @@ class TypeAhead:
             self.idle_render()
 
     # --- generic picker (runs in reader thread, blocking main thread) ---------
-    def _handle_picker(self, ch: str) -> None:
+    def _handle_picker(self, ch: str, getch: Callable[[], str]) -> None:
         """Handle a keystroke while a generic picker is active. The main thread
         is blocked on picker_done; this method navigates, filters, and selects."""
-        act = self._editor.handle(ch, lambda: "")
+        act = self._editor.handle(ch, getch)
         items = self.picker_items
         desc = self.picker_descriptions
 
